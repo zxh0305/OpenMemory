@@ -24,19 +24,6 @@ services:
       - DATABASE_URL=${DATABASE_URL:-sqlite:///./openmemory.db}
       - USER=${USER:-default_user}
       - CREATE_DEFAULT_USER=${CREATE_DEFAULT_USER:-false}
-      # 硅基流动 API 配置 - 使用 1024 维嵌入模型（实际维度）
-      - OPENAI_API_KEY=sk-nndjpptkxakuaogwbixoooieyytcagyyiwczdwcqefppujlj
-      - OPENAI_PROVIDER=openai
-      - OPENAI_BASE_URL=https://api.siliconflow.cn/v1
-      - OPENAI_MODEL=deepseek-ai/DeepSeek-V3
-      - OPENAI_EMBEDDING_MODEL_API_KEY=sk-nndjpptkxakuaogwbixoooieyytcagyyiwczdwcqefppujlj
-      - OPENAI_EMBEDDING_MODEL_BASE_URL=https://api.siliconflow.cn/v1
-      - OPENAI_EMBEDDING_MODEL=BAAI/bge-large-zh-v1.5
-      - OPENAI_EMBEDDING_MODEL_DIMS=1024
-      - CATEGORIZATION_OPENAI_BASE_URL=https://api.siliconflow.cn/v1
-      - CATEGORIZATION_OPENAI_API_KEY=sk-nndjpptkxakuaogwbixoooieyytcagyyiwczdwcqefppujlj
-      - CATEGORIZATION_OPENAI_MODEL=deepseek-ai/DeepSeek-V3
-      - CATEGORIZATION_OPENAI_PROVIDER=openai_structured
       - QDRANT_HOST=mem0_store
       - QDRANT_PORT=6333
     depends_on:
@@ -66,6 +53,7 @@ services:
     env_file:
       - ui/.env
     environment:
+      - PORT=4000
       - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8765}
       - NEXT_PUBLIC_USER_ID=${NEXT_PUBLIC_USER_ID:-${USER:-default_user}}
     depends_on:

@@ -37,4 +37,7 @@ echo "Done replacing env variables NEXT_PUBLIC_ with real values"
 
 
 # Execute the container's main process (CMD in Dockerfile)
+# Ensure PORT env var is set (used by Next.js server.js)
+# If not set, default to 4000
+export PORT=${PORT:-4000}
 exec "$@"

@@ -340,45 +340,78 @@ async def create_memory(
 
     # Log what we're about to do
     logging.info(f"Creating memory for user_id: {request.user_id} with app: {request.app}")
-    
-    # Try to get memory client safely
+
+    def build_create_response(memory: Memory) -> dict:
+        return {
+            "ai_extraction_used": True,
+            "message": "已提取信息并存入",
+            "id": str(memory.id),
+            # user_id in DB is internal UUID; return both external and internal IDs
+            "user_id": request.user_id,
+            "user_uuid": str(memory.user_id),
+            "app_id": str(memory.app_id),
+            "original_text": request.text,
+            "extracted_text": memory.content,
+            "content": memory.content,
+            "metadata_": memory.metadata_,
+            "state": memory.state.value if hasattr(memory.state, "value") else str(memory.state),
+            "created_at": int(memory.created_at.timestamp()) if memory.created_at else None
+        }
+
+    def build_fallback_response(memory: Memory, reason: str, message: str) -> dict:
+        return {
+            "ai_extraction_used": False,
+            "reason": reason,
+            "message": message,
+            "id": str(memory.id),
+            "user_id": request.user_id,
+            "user_uuid": str(memory.user_id),
+            "app_id": str(memory.app_id),
+            "original_text": request.text,
+            "extracted_text": None,
+            "content": memory.content,
+            "metadata_": memory.metadata_,
+            "state": memory.state.value if hasattr(memory.state, "value") else str(memory.state),
+            "created_at": int(memory.created_at.timestamp()) if memory.created_at else None
+        }
+
+    def save_fallback(reason: str, message: str) -> dict:
+        memory = Memory(
+            id=uuid4(),
+            user_id=user.id,
+            app_id=app_obj.id,
+            content=request.text,
+            metadata_=request.metadata,
+            state=MemoryState.active
+        )
+        db.add(memory)
+        db.commit()
+        db.refresh(memory)
+
+        history = MemoryStatusHistory(
+            memory_id=memory.id,
+            changed_by=user.id,
+            old_state=MemoryState.deleted,
+            new_state=MemoryState.active
+        )
+        db.add(history)
+        db.commit()
+
+        logging.info(f"Memory created via fallback: {memory.id} (reason={reason})")
+        return build_fallback_response(memory, reason, message)
+
+    # If infer is disabled, skip AI extraction and store original text
+    if not request.infer:
+        return save_fallback("ai_disabled", "未启用AI提取，已存入原文")
+
+    # Try to get memory client for extraction
     try:
         memory_client = get_memory_client()
         if not memory_client:
             raise Exception("Memory client is not available")
     except Exception as client_error:
-        logging.warning(f"Memory client unavailable: {client_error}. Attempting database fallback.")
-        
-        try:
-            # 直接创建数据库记录，不依赖Memory客户端
-            memory = Memory(
-                id=uuid4(),  # 生成新的UUID
-                user_id=user.id,
-                app_id=app_obj.id,
-                content=request.text,
-                metadata_=request.metadata,
-                state=MemoryState.active
-            )
-            db.add(memory)
-            db.commit()
-            db.refresh(memory)
-            
-            # 创建历史记录
-            history = MemoryStatusHistory(
-                memory_id=memory.id,
-                changed_by=user.id,
-                old_state=MemoryState.deleted,
-                new_state=MemoryState.active
-            )
-            db.add(history)
-            db.commit()
-            
-            logging.info(f"Memory created via database fallback (no memory client): {memory.id}")
-            return memory
-            
-        except Exception as db_error:
-            logging.error(f"Database fallback also failed: {db_error}")
-            raise HTTPException(status_code=500, detail=f"Failed to create memory: {str(db_error)}")
+        logging.error(f"Memory client unavailable: {client_error}")
+        return save_fallback("memory_client_unavailable", "未使用AI提取：memory_client不可用，已使用原文存入")
 
     # Try to save to Qdrant via memory_client
     try:
@@ -396,7 +429,8 @@ async def create_memory(
         
         # Process Qdrant response
         if isinstance(qdrant_response, dict) and 'results' in qdrant_response:
-            for result in qdrant_response['results']:
+            results = qdrant_response.get('results') or []
+            for result in results:
                 event_type = result.get('event')
                 # 优化提示：建议 LLM 输出格式，明确 event 字段要求
                 if event_type not in ['ADD', 'UPDATE', 'DELETE', 'NONE']:
@@ -435,7 +469,7 @@ async def create_memory(
                     db.add(history)
                     db.commit()
                     db.refresh(memory)
-                    return memory
+                    return build_create_response(memory)
                 else:
                     # 兜底：只要有 text 或 memory 字段就强制写入
                     if result.get('memory') or result.get('text'):
@@ -459,40 +493,15 @@ async def create_memory(
                         db.add(history)
                         db.commit()
                         db.refresh(memory)
-                        return memory
+                        return build_create_response(memory)
+            # AI ran but produced no usable memory -> fallback to original text
+            if not results:
+                return save_fallback("ai_extraction_empty", "AI提取未返回可写入结果，已使用原文存入")
+            return save_fallback("ai_extraction_no_valid_event", "AI提取结果无法写入（event不合规），已使用原文存入")
+        return save_fallback("ai_extraction_invalid_response", "AI提取返回格式不正确，已使用原文存入")
     except Exception as qdrant_error:
-        logging.warning(f"Qdrant operation failed: {qdrant_error}. Attempting database fallback.")
-        
-        try:
-            # 直接创建数据库记录，不依赖Qdrant
-            memory = Memory(
-                id=uuid4(),  # 生成新的UUID，不依赖Qdrant
-                user_id=user.id,
-                app_id=app_obj.id,
-                content=request.text,
-                metadata_=request.metadata,
-                state=MemoryState.active
-            )
-            db.add(memory)
-            db.commit()
-            db.refresh(memory)
-            
-            # 创建历史记录
-            history = MemoryStatusHistory(
-                memory_id=memory.id,
-                changed_by=user.id,
-                old_state=MemoryState.deleted,
-                new_state=MemoryState.active
-            )
-            db.add(history)
-            db.commit()
-            
-            logging.info(f"Memory created via database fallback: {memory.id}")
-            return memory
-            
-        except Exception as db_error:
-            logging.error(f"Database fallback also failed: {db_error}")
-            raise HTTPException(status_code=500, detail=f"Failed to create memory: {str(db_error)}")
+        logging.error(f"Qdrant/LLM operation failed: {qdrant_error}")
+        return save_fallback("ai_extraction_failed", "未使用AI提取：AI/向量存储写入失败，已使用原文存入")
 
 
 
