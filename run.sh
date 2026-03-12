@@ -33,7 +33,7 @@ if [ $(docker ps -aq -f name=mem0_ui) ]; then
   docker rm -f mem0_ui
 fi
 
-# Find an available port starting from 3000
+# Find an available port starting from 4000
 echo "🔍 Looking for available port for frontend..."
 for port in {4000..4010}; do
   if ! lsof -i:$port >/dev/null 2>&1; then
@@ -88,7 +88,7 @@ docker compose up -d
 echo "🚀 Starting frontend on port $FRONTEND_PORT..."
 docker run -d \
   --name mem0_ui \
-  -p ${FRONTEND_PORT}:3000 \
+  -p ${FRONTEND_PORT}:4000 \
   -e NEXT_PUBLIC_API_URL="$NEXT_PUBLIC_API_URL" \
   -e NEXT_PUBLIC_USER_ID="$USER" \
   mem0/openmemory-ui:latest
@@ -109,4 +109,4 @@ elif command -v start > /dev/null; then
 else
   echo "⚠️ Could not detect a method to open the browser. Please open $URL manually."
 fi
-
+

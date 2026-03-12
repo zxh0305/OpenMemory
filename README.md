@@ -80,7 +80,7 @@ docker compose up -d
 这将启动以下组件：
 - **Qdrant Vector Store**: `http://localhost:6333`
 - **MCP Server (API)**: `http://localhost:8765`
-- **前端 UI**: `http://localhost:3000`
+- **前端 UI**: `http://localhost:4000`
 
 > ✅ 你可以在 `http://localhost:8765/docs` 查看 API 文档。
 
@@ -102,7 +102,7 @@ OpenMemory 完全支持多用户，每个用户拥有独立的记忆数据：
 ### ✅ MCP 配置说明
 
 - MCP 的 SSE 接口：`http://localhost:8765/mcp/openmemory/sse/{user_id}`
-- MCP 前端界面：在 `http://localhost:3000` 可以访问 MCP 的前端界面
+- MCP 前端界面：在 `http://localhost:4000` 可以访问 MCP 的前端界面
   - 在那里，你可以查看各个 MCP 客户端的配置命令
   - 并且可以查看 Memories 存储的数据。
 
