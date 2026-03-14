@@ -358,7 +358,30 @@ async def create_memory(
             "created_at": int(memory.created_at.timestamp()) if memory.created_at else None
         }
 
-    def build_fallback_response(memory: Memory, reason: str, message: str) -> dict:
+    def build_summary_response(memory: Memory, summary: str) -> dict:
+        return {
+            "ai_extraction_used": True,
+            "reason": "long_text_summarized",
+            "message": "长文本已摘要存入",
+            "id": str(memory.id),
+            "user_id": request.user_id,
+            "user_uuid": str(memory.user_id),
+            "app_id": str(memory.app_id),
+            "original_text": request.text,
+            "extracted_text": summary,
+            "content": summary,
+            "metadata_": memory.metadata_,
+            "state": memory.state.value if hasattr(memory.state, "value") else str(memory.state),
+            "created_at": int(memory.created_at.timestamp()) if memory.created_at else None
+        }
+
+    def build_fallback_response(
+        memory: Memory,
+        reason: str,
+        message: str,
+        content_used: str,
+        extracted_text: str | None
+    ) -> dict:
         return {
             "ai_extraction_used": False,
             "reason": reason,
@@ -368,19 +391,20 @@ async def create_memory(
             "user_uuid": str(memory.user_id),
             "app_id": str(memory.app_id),
             "original_text": request.text,
-            "extracted_text": None,
-            "content": memory.content,
+            "extracted_text": extracted_text,
+            "content": content_used,
             "metadata_": memory.metadata_,
             "state": memory.state.value if hasattr(memory.state, "value") else str(memory.state),
             "created_at": int(memory.created_at.timestamp()) if memory.created_at else None
         }
 
-    def save_fallback(reason: str, message: str) -> dict:
+    def save_fallback(reason: str, message: str, content_override: str | None = None, extracted_text: str | None = None) -> dict:
+        content_value = content_override or request.text
         memory = Memory(
             id=uuid4(),
             user_id=user.id,
             app_id=app_obj.id,
-            content=request.text,
+            content=content_value,
             metadata_=request.metadata,
             state=MemoryState.active
         )
@@ -398,7 +422,109 @@ async def create_memory(
         db.commit()
 
         logging.info(f"Memory created via fallback: {memory.id} (reason={reason})")
-        return build_fallback_response(memory, reason, message)
+        return build_fallback_response(memory, reason, message, content_value, extracted_text)
+
+    def save_summary(summary: str) -> dict:
+        memory = Memory(
+            id=uuid4(),
+            user_id=user.id,
+            app_id=app_obj.id,
+            content=summary,
+            metadata_=request.metadata,
+            state=MemoryState.active
+        )
+        db.add(memory)
+        db.commit()
+        db.refresh(memory)
+
+        history = MemoryStatusHistory(
+            memory_id=memory.id,
+            changed_by=user.id,
+            old_state=MemoryState.deleted,
+            new_state=MemoryState.active
+        )
+        db.add(history)
+        db.commit()
+
+        logging.info(f"Memory created via AI summary: {memory.id}")
+        return build_summary_response(memory, summary)
+
+    def extract_summary_from_long_text(text: str) -> str | None:
+        # Heuristic summary for long dialogues with timestamps, focusing on "用户:" lines.
+        # Example output: "01:01:59 用户提到：xxx"
+        import re
+
+        user_line_re = re.compile(r"\\[(\\d{2}:\\d{2}:\\d{2})\\]\\s*用户[:：]\\s*(.+)")
+        first_user = None
+
+        for line in text.splitlines():
+            m = user_line_re.search(line)
+            if not m:
+                continue
+            ts = m.group(1)
+            content = m.group(2).strip()
+            if not content:
+                continue
+            if first_user is None:
+                first_user = (ts, content)
+
+        if first_user:
+            ts, content = first_user
+            short_content = content[:80].rstrip()
+            return f"{ts} 用户提到：{short_content}"
+
+        if text.strip():
+            short_text = text.strip().replace("\n", " ")
+            return f"用户提到：{short_text[:120].rstrip()}"
+
+        return None
+
+    def summarize_long_text_with_ai(text: str) -> str | None:
+        try:
+            from openai import OpenAI
+            from app.utils.memory import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+
+            if not OPENAI_API_KEY:
+                return None
+
+            client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+            system_prompt = (
+                "你是一个对话摘要与事实提取助手。请先用1-2句话总结对话核心信息，"
+                "再列出3-6条“用户明确表达的事实/诉求/问题”。"
+                "忽略AI的安慰/复述内容，只关注用户内容。"
+                "请用中文输出，格式如下：\n"
+                "摘要：...\n"
+                "事实：\n"
+                "1. ...\n2. ...\n"
+            )
+
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text}
+                ],
+                temperature=0.2,
+                max_tokens=800
+            )
+            content = (resp.choices[0].message.content or "").strip()
+            return content if content else None
+        except Exception as e:
+            logging.error(f"AI summary failed: {e}")
+            return None
+
+    # If text is too long, store a summary only (no full text)
+    if len(request.text) > 1000:
+        summary = summarize_long_text_with_ai(request.text)
+        if summary:
+            return save_summary(summary)
+        heuristic = extract_summary_from_long_text(request.text) or "用户提供了较长对话记录，已摘要存入"
+        return save_fallback(
+            "ai_summary_failed",
+            "AI摘要失败，已使用简要摘要存入",
+            content_override=heuristic,
+            extracted_text=heuristic
+        )
 
     # If infer is disabled, skip AI extraction and store original text
     if not request.infer:
@@ -496,6 +622,14 @@ async def create_memory(
                         return build_create_response(memory)
             # AI ran but produced no usable memory -> fallback to original text
             if not results:
+                summary = extract_summary_from_long_text(request.text)
+                if summary:
+                    return save_fallback(
+                        "ai_extraction_empty",
+                        "AI提取未返回可写入结果，已提取摘要存入",
+                        content_override=summary,
+                        extracted_text=summary
+                    )
                 return save_fallback("ai_extraction_empty", "AI提取未返回可写入结果，已使用原文存入")
             return save_fallback("ai_extraction_no_valid_event", "AI提取结果无法写入（event不合规），已使用原文存入")
         return save_fallback("ai_extraction_invalid_response", "AI提取返回格式不正确，已使用原文存入")
