@@ -1,8 +1,10 @@
 from datetime import datetime, UTC
 from typing import List, Optional, Set
 from uuid import UUID, uuid4
+import json
 import logging
 import os
+import re
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, joinedload
 from fastapi_pagination import Page, Params
@@ -14,11 +16,16 @@ from app.utils.memory import get_memory_client
 from app.database import get_db
 from app.models import (
     Memory, MemoryState, MemoryAccessLog, App,
+    RawMemoryInput,
     MemoryStatusHistory, User, Category, AccessControl, Config as ConfigModel
 )
 from app.schemas import MemoryResponse, PaginatedMemoryResponse
 from app.utils.permissions import check_memory_access_permissions
 from app.utils.db import get_or_create_user
+from custom_memory_prompt import (
+    STRUCTURED_MEMORY_EXTRACTION_PROMPT,
+    LONG_TEXT_STRUCTURED_MEMORY_EXTRACTION_PROMPT,
+)
 
 """
 记忆管理API路由
@@ -297,6 +304,107 @@ class CreateMemoryRequest(BaseModel):
     app: str = "openmemory"
 
 
+@router.get("/raw-inputs")
+async def list_raw_memory_inputs(
+    user_id: str,
+    app: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db)
+):
+    user = get_or_create_user(db, user_id)
+
+    query = db.query(RawMemoryInput).filter(RawMemoryInput.user_id == user.id)
+
+    if app:
+        app_obj = db.query(App).filter(
+            App.name == app,
+            App.owner_id == user.id
+        ).first()
+        if not app_obj:
+            return {
+                "items": [],
+                "total": 0,
+                "page": page,
+                "size": size,
+            }
+        query = query.filter(RawMemoryInput.app_id == app_obj.id)
+
+    total = query.count()
+    items = query.order_by(RawMemoryInput.created_at.desc()).offset((page - 1) * size).limit(size).all()
+
+    return {
+        "items": [
+            {
+                "id": str(item.id),
+                "user_id": user_id,
+                "user_uuid": str(item.user_id),
+                "app_id": str(item.app_id),
+                "original_text": item.original_text,
+                "summary": item.summary,
+                "extracted_facts": item.extracted_facts or [],
+                "infer": item.infer,
+                "processing_status": item.processing_status,
+                "error_reason": item.error_reason,
+                "metadata_": item.metadata_,
+                "processed_at": int(item.processed_at.timestamp()) if item.processed_at else None,
+                "created_at": int(item.created_at.timestamp()) if item.created_at else None,
+            }
+            for item in items
+        ],
+        "total": total,
+        "page": page,
+        "size": size,
+    }
+
+
+@router.get("/raw-inputs/{raw_input_id}")
+async def get_raw_memory_input(
+    raw_input_id: UUID,
+    db: Session = Depends(get_db)
+):
+    raw_input = db.query(RawMemoryInput).filter(RawMemoryInput.id == raw_input_id).first()
+    if not raw_input:
+        raise HTTPException(status_code=404, detail="Raw memory input not found")
+
+    linked_memories = []
+    candidate_memories = db.query(Memory).filter(
+        Memory.user_id == raw_input.user_id,
+        Memory.app_id == raw_input.app_id,
+        Memory.state != MemoryState.deleted,
+    ).order_by(Memory.created_at.asc()).all()
+
+    for memory in candidate_memories:
+        metadata = memory.metadata_ or {}
+        if metadata.get("raw_record_id") == str(raw_input.id):
+            linked_memories.append(
+                {
+                    "id": str(memory.id),
+                    "content": memory.content,
+                    "fact_index": metadata.get("fact_index"),
+                    "metadata_": metadata,
+                    "state": memory.state.value if hasattr(memory.state, "value") else str(memory.state),
+                    "created_at": int(memory.created_at.timestamp()) if memory.created_at else None,
+                }
+            )
+
+    return {
+        "id": str(raw_input.id),
+        "user_uuid": str(raw_input.user_id),
+        "app_id": str(raw_input.app_id),
+        "original_text": raw_input.original_text,
+        "summary": raw_input.summary,
+        "extracted_facts": raw_input.extracted_facts or [],
+        "infer": raw_input.infer,
+        "processing_status": raw_input.processing_status,
+        "error_reason": raw_input.error_reason,
+        "metadata_": raw_input.metadata_,
+        "processed_at": int(raw_input.processed_at.timestamp()) if raw_input.processed_at else None,
+        "created_at": int(raw_input.created_at.timestamp()) if raw_input.created_at else None,
+        "linked_memories": linked_memories,
+    }
+
+
 # Create new memory
 @router.post("/")
 async def create_memory(
@@ -323,319 +431,926 @@ async def create_memory(
     - 如果应用处于暂停状态，将无法创建记忆
     - 系统会自动提取事实信息并分类
     """
-    # 使用 get_or_create_user 确保用户存在，如果不存在则自动创建
     user = get_or_create_user(db, request.user_id)
-    # Get or create app
-    app_obj = db.query(App).filter(App.name == request.app,
-                                   App.owner_id == user.id).first()
+    app_obj = db.query(App).filter(
+        App.name == request.app,
+        App.owner_id == user.id
+    ).first()
     if not app_obj:
         app_obj = App(name=request.app, owner_id=user.id)
         db.add(app_obj)
         db.commit()
         db.refresh(app_obj)
 
-    # Check if app is active
     if not app_obj.is_active:
-        raise HTTPException(status_code=403, detail=f"App {request.app} is currently paused on OpenMemory. Cannot create new memories.")
+        raise HTTPException(
+            status_code=403,
+            detail=f"App {request.app} is currently paused on OpenMemory. Cannot create new memories."
+        )
 
-    # Log what we're about to do
     logging.info(f"Creating memory for user_id: {request.user_id} with app: {request.app}")
 
-    def build_create_response(memory: Memory) -> dict:
+    raw_input = RawMemoryInput(
+        id=uuid4(),
+        user_id=user.id,
+        app_id=app_obj.id,
+        original_text=request.text,
+        metadata_=request.metadata,
+        infer=request.infer,
+        processing_status="pending",
+    )
+    db.add(raw_input)
+    db.commit()
+    db.refresh(raw_input)
+
+    def memory_to_dict(memory: Memory) -> dict:
         return {
-            "ai_extraction_used": True,
-            "message": "已提取信息并存入",
             "id": str(memory.id),
-            # user_id in DB is internal UUID; return both external and internal IDs
-            "user_id": request.user_id,
-            "user_uuid": str(memory.user_id),
-            "app_id": str(memory.app_id),
-            "original_text": request.text,
-            "extracted_text": memory.content,
             "content": memory.content,
             "metadata_": memory.metadata_,
             "state": memory.state.value if hasattr(memory.state, "value") else str(memory.state),
-            "created_at": int(memory.created_at.timestamp()) if memory.created_at else None
+            "created_at": int(memory.created_at.timestamp()) if memory.created_at else None,
         }
 
-    def build_summary_response(memory: Memory, summary: str) -> dict:
-        return {
-            "ai_extraction_used": True,
-            "reason": "long_text_summarized",
-            "message": "长文本已摘要存入",
-            "id": str(memory.id),
-            "user_id": request.user_id,
-            "user_uuid": str(memory.user_id),
-            "app_id": str(memory.app_id),
-            "original_text": request.text,
-            "extracted_text": summary,
-            "content": summary,
-            "metadata_": memory.metadata_,
-            "state": memory.state.value if hasattr(memory.state, "value") else str(memory.state),
-            "created_at": int(memory.created_at.timestamp()) if memory.created_at else None
-        }
-
-    def build_fallback_response(
-        memory: Memory,
+    def build_create_response(
+        memories: List[Memory],
+        ai_used: bool,
         reason: str,
-        message: str,
-        content_used: str,
-        extracted_text: str | None
+        message: str
     ) -> dict:
         return {
-            "ai_extraction_used": False,
+            "ai_extraction_used": ai_used,
             "reason": reason,
             "message": message,
-            "id": str(memory.id),
+            "raw_record_id": str(raw_input.id),
             "user_id": request.user_id,
-            "user_uuid": str(memory.user_id),
-            "app_id": str(memory.app_id),
+            "user_uuid": str(user.id),
+            "app_id": str(app_obj.id),
             "original_text": request.text,
-            "extracted_text": extracted_text,
-            "content": content_used,
-            "metadata_": memory.metadata_,
-            "state": memory.state.value if hasattr(memory.state, "value") else str(memory.state),
-            "created_at": int(memory.created_at.timestamp()) if memory.created_at else None
+            "summary": raw_input.summary,
+            "extracted_facts": raw_input.extracted_facts or [],
+            "created_count": len(memories),
+            "created_memories": [memory_to_dict(memory) for memory in memories],
         }
 
-    def save_fallback(reason: str, message: str, content_override: str | None = None, extracted_text: str | None = None) -> dict:
-        content_value = content_override or request.text
-        memory = Memory(
-            id=uuid4(),
-            user_id=user.id,
-            app_id=app_obj.id,
-            content=content_value,
-            metadata_=request.metadata,
-            state=MemoryState.active
-        )
-        db.add(memory)
+    def update_raw_input(
+        status: str,
+        summary: str | None = None,
+        facts: List[str] | None = None,
+        error_reason: str | None = None
+    ) -> None:
+        raw_input.processing_status = status
+        raw_input.summary = summary
+        raw_input.extracted_facts = facts or []
+        raw_input.error_reason = error_reason
+        raw_input.processed_at = datetime.now(UTC)
+        db.add(raw_input)
         db.commit()
-        db.refresh(memory)
+        db.refresh(raw_input)
 
-        history = MemoryStatusHistory(
-            memory_id=memory.id,
-            changed_by=user.id,
-            old_state=MemoryState.deleted,
-            new_state=MemoryState.active
+    def normalize_fact_text(fact: str) -> str:
+        fact = re.sub(r"^\s*\d+[\.\:：、]\s*", "", fact).strip()
+        if fact.startswith("我的"):
+            fact = "用户的" + fact[2:]
+        elif fact.startswith("我"):
+            fact = "用户" + fact[1:]
+        fact = fact.replace("用户妻子", "用户的妻子")
+        fact = fact.replace("用户儿子", "用户的儿子")
+        fact = fact.replace("用户女儿", "用户的女儿")
+        return fact.strip(" \n\t，,。；;")
+
+    def dedupe_facts(facts: List[str]) -> List[str]:
+        normalized = []
+        seen = set()
+        for fact in facts:
+            clean_fact = normalize_fact_text(fact)
+            if not clean_fact or clean_fact in seen:
+                continue
+            seen.add(clean_fact)
+            normalized.append(clean_fact)
+        return normalized
+
+    def extract_user_messages(text: str) -> List[dict]:
+        messages = []
+        line_pattern = re.compile(r"^\s*(?:\[(?P<ts>\d{2}:\d{2}:\d{2})\]\s*)?(?P<speaker>用户|AI|用\s*户)\s*[:：]\s*(?P<content>.*)$")
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            match = line_pattern.match(line)
+            if not match:
+                continue
+
+            speaker = re.sub(r"\s+", "", match.group("speaker"))
+            content = re.sub(r"\s+", " ", (match.group("content") or "")).strip()
+            if not content:
+                continue
+
+            messages.append(
+                {
+                    "timestamp": match.group("ts"),
+                    "speaker": speaker,
+                    "content": content,
+                }
+            )
+
+        return messages
+
+    def build_user_only_messages(text: str) -> List[dict]:
+        return [msg for msg in extract_user_messages(text) if msg["speaker"] == "用户"]
+
+    def render_user_messages(messages: List[dict]) -> str:
+        return "\n".join(
+            f"[{msg['timestamp']}] 用户: {msg['content']}" if msg["timestamp"] else f"用户: {msg['content']}"
+            for msg in messages
         )
-        db.add(history)
-        db.commit()
 
-        logging.info(f"Memory created via fallback: {memory.id} (reason={reason})")
-        return build_fallback_response(memory, reason, message, content_value, extracted_text)
+    def is_system_ai_message(content: str) -> bool:
+        keywords = [
+            "正在联系",
+            "已短信通知",
+            "已通知",
+            "正在为您拍照",
+            "正在拍照",
+            "已拍照",
+            "正在报警",
+            "已报警",
+            "正在拨打",
+            "已拨打",
+            "紧急联系人",
+        ]
+        return any(keyword in content for keyword in keywords)
 
-    def save_summary(summary: str) -> dict:
-        memory = Memory(
-            id=uuid4(),
-            user_id=user.id,
-            app_id=app_obj.id,
-            content=summary,
-            metadata_=request.metadata,
-            state=MemoryState.active
-        )
-        db.add(memory)
-        db.commit()
-        db.refresh(memory)
+    def is_contextual_ai_message(content: str) -> bool:
+        keywords = [
+            "您是说",
+            "是不是",
+            "我听着像是",
+            "充电站",
+            "供电",
+            "付款",
+            "退款",
+            "转账",
+            "紧急联系人",
+            "拍照",
+            "报警",
+            "风险",
+            "联系人",
+        ]
+        return any(keyword in content for keyword in keywords)
 
-        history = MemoryStatusHistory(
-            memory_id=memory.id,
-            changed_by=user.id,
-            old_state=MemoryState.deleted,
-            new_state=MemoryState.active
-        )
-        db.add(history)
-        db.commit()
+    def build_summary_context_messages(text: str) -> List[dict]:
+        messages = extract_user_messages(text)
+        selected = []
+        for msg in messages:
+            if msg["speaker"] == "用户":
+                selected.append(msg)
+            elif msg["speaker"] == "AI" and (is_system_ai_message(msg["content"]) or is_contextual_ai_message(msg["content"])):
+                selected.append(msg)
+        return selected
 
-        logging.info(f"Memory created via AI summary: {memory.id}")
-        return build_summary_response(memory, summary)
+    def render_messages(messages: List[dict]) -> str:
+        rendered = []
+        for msg in messages:
+            prefix = f"[{msg['timestamp']}] " if msg.get("timestamp") else ""
+            rendered.append(f"{prefix}{msg['speaker']}: {msg['content']}")
+        return "\n".join(rendered)
+
+    def get_memory_date_prefix() -> str | None:
+        sync_time = (request.metadata or {}).get("sync_time")
+        if not sync_time or not isinstance(sync_time, str):
+            return None
+
+        try:
+            normalized = sync_time.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(normalized)
+            return f"{parsed.month}.{parsed.day}日"
+        except ValueError:
+            return None
+
+    def format_memory_content(content: str, fact_type: str | None = None) -> str:
+        normalized = re.sub(r"\s+", " ", content).strip()
+        if not normalized:
+            return normalized
+
+        date_prefix = get_memory_date_prefix()
+        if fact_type == "session_summary":
+            normalized = re.sub(r"^(整段摘要：|摘要：)", "", normalized).strip()
+            normalized = f"摘要：{normalized}"
+        elif fact_type == "segment_summary":
+            normalized = re.sub(r"^(第\d+段(?:（.*?）)?：)", "", normalized).strip()
+            normalized = f"摘要：{normalized}"
+
+        if date_prefix and not normalized.startswith(date_prefix):
+            return f"{date_prefix}{normalized}"
+        return normalized
+
+    def segment_user_messages(messages: List[dict], max_items: int = 20, max_chars: int = 2200) -> List[dict]:
+        if not messages:
+            return []
+
+        segments = []
+        current = []
+        current_chars = 0
+
+        for message in messages:
+            rendered = f"[{message['timestamp']}] 用户: {message['content']}" if message["timestamp"] else f"用户: {message['content']}"
+            projected_chars = current_chars + len(rendered) + 1
+            if current and (len(current) >= max_items or projected_chars > max_chars):
+                start_ts = current[0].get("timestamp")
+                end_ts = current[-1].get("timestamp")
+                segments.append(
+                    {
+                        "segment_index": len(segments) + 1,
+                        "time_range": f"{start_ts}-{end_ts}" if start_ts and end_ts else None,
+                        "messages": current,
+                        "text": render_user_messages(current),
+                    }
+                )
+                current = []
+                current_chars = 0
+
+            current.append(message)
+            current_chars += len(rendered) + 1
+
+        if current:
+            start_ts = current[0].get("timestamp")
+            end_ts = current[-1].get("timestamp")
+            segments.append(
+                {
+                    "segment_index": len(segments) + 1,
+                    "time_range": f"{start_ts}-{end_ts}" if start_ts and end_ts else None,
+                    "messages": current,
+                    "text": render_user_messages(current),
+                }
+            )
+
+        return segments
 
     def extract_summary_from_long_text(text: str) -> str | None:
-        # Heuristic summary for long dialogues with timestamps, focusing on "用户:" lines.
-        # Example output: "01:01:59 用户提到：xxx"
-        import re
-
-        user_line_re = re.compile(r"\\[(\\d{2}:\\d{2}:\\d{2})\\]\\s*用户[:：]\\s*(.+)")
+        user_line_re = re.compile(r"\[(\d{2}:\d{2}:\d{2})\]\s*用户[:：]\s*(.+)")
         first_user = None
 
         for line in text.splitlines():
-            m = user_line_re.search(line)
-            if not m:
+            match = user_line_re.search(line)
+            if not match:
                 continue
-            ts = m.group(1)
-            content = m.group(2).strip()
+            content = match.group(2).strip()
             if not content:
                 continue
-            if first_user is None:
-                first_user = (ts, content)
+            first_user = (match.group(1), content)
+            break
 
         if first_user:
-            ts, content = first_user
-            short_content = content[:80].rstrip()
-            return f"{ts} 用户提到：{short_content}"
+            return f"{first_user[0]} 用户提到：{first_user[1][:100].rstrip()}"
 
         if text.strip():
-            short_text = text.strip().replace("\n", " ")
-            return f"用户提到：{short_text[:120].rstrip()}"
-
+            return f"用户提到：{text.strip().replace(chr(10), ' ')[:120].rstrip()}"
         return None
 
-    def summarize_long_text_with_ai(text: str) -> str | None:
-        try:
-            from openai import OpenAI
-            from app.utils.memory import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+    def should_use_long_text_pipeline(text: str) -> bool:
+        user_messages = build_user_only_messages(text)
+        if len(text) > 1000:
+            return True
+        if len(user_messages) >= 8:
+            return True
+        return len(user_messages) >= 4 and len(text) > 400
 
-            if not OPENAI_API_KEY:
-                return None
-
-            client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
-            system_prompt = (
-                "你是一个对话摘要与事实提取助手。请先用1-2句话总结对话核心信息，"
-                "再列出3-6条“用户明确表达的事实/诉求/问题”。"
-                "忽略AI的安慰/复述内容，只关注用户内容。"
-                "请用中文输出，格式如下：\n"
-                "摘要：...\n"
-                "事实：\n"
-                "1. ...\n2. ...\n"
-            )
-
-            resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": text}
-                ],
-                temperature=0.2,
-                max_tokens=800
-            )
-            content = (resp.choices[0].message.content or "").strip()
-            return content if content else None
-        except Exception as e:
-            logging.error(f"AI summary failed: {e}")
+    def build_fact_payload(
+        content: str,
+        subject: str | None = None,
+        fact_type: str = "fact",
+        confidence: str = "medium",
+        segment_index: int | None = None,
+    ) -> dict | None:
+        normalized_content = normalize_fact_text(content)
+        if not normalized_content:
             return None
+        return {
+            "content": normalized_content,
+            "subject": subject,
+            "type": fact_type or "fact",
+            "confidence": (confidence or "medium").lower(),
+            "segment_index": segment_index,
+        }
 
-    # If text is too long, store a summary only (no full text)
-    if len(request.text) > 1000:
-        summary = summarize_long_text_with_ai(request.text)
-        if summary:
-            return save_summary(summary)
-        heuristic = extract_summary_from_long_text(request.text) or "用户提供了较长对话记录，已摘要存入"
-        return save_fallback(
-            "ai_summary_failed",
-            "AI摘要失败，已使用简要摘要存入",
-            content_override=heuristic,
-            extracted_text=heuristic
+    def extract_ai_system_event_payloads(text: str, segment_index: int | None = None) -> List[dict]:
+        payloads = []
+        for msg in extract_user_messages(text):
+            if msg["speaker"] != "AI":
+                continue
+            if not is_system_ai_message(msg["content"]):
+                continue
+            normalized_content = msg["content"]
+            if "紧急联系人" in normalized_content and ("已短信通知" in normalized_content or "已通知" in normalized_content):
+                normalized_content = normalized_content.replace("：", "").replace("，", "")
+                normalized_content = normalized_content.replace("已短信通知", "系统已短信通知")
+            elif "正在联系" in normalized_content and "紧急联系人" in normalized_content:
+                normalized_content = "系统正在联系用户的紧急联系人，请稍后"
+            elif "拍照" in normalized_content:
+                normalized_content = "系统正在为用户拍照"
+            payload = build_fact_payload(
+                normalized_content,
+                subject="系统",
+                fact_type="system_event",
+                confidence="high",
+                segment_index=segment_index,
+            )
+            if payload:
+                payloads.append(payload)
+        return dedupe_fact_payloads(payloads)
+
+    def heuristic_extract_facts(text: str) -> List[str]:
+        user_messages = build_user_only_messages(text)
+        if not user_messages:
+            cleaned_text = re.sub(r"\s+", " ", text.strip())
+            return [f"用户提到：{cleaned_text[:120].rstrip()}"] if cleaned_text else []
+
+        base_segments = []
+        for message in user_messages:
+            base_segments.extend(re.split(r"[。！？；;\n]+", message["content"]))
+
+        clauses = []
+        for segment in base_segments:
+            for clause in re.split(r"[，,]", segment):
+                clean_clause = clause.strip()
+                if clean_clause:
+                    clauses.append(clean_clause)
+
+        contextualized = []
+        current_subject = "用户"
+
+        for clause in clauses:
+            candidate = clause
+            if candidate.startswith("我妻子") or candidate.startswith("妻子"):
+                if candidate.startswith("我妻子"):
+                    candidate = "用户的妻子" + candidate[3:]
+                else:
+                    candidate = "用户的妻子" + candidate[2:]
+                current_subject = "用户的妻子"
+            elif candidate.startswith("我儿子") or candidate.startswith("儿子"):
+                if candidate.startswith("我儿子"):
+                    candidate = "用户的儿子" + candidate[3:]
+                else:
+                    candidate = "用户的儿子" + candidate[2:]
+                current_subject = "用户的儿子"
+            elif candidate.startswith("我女儿") or candidate.startswith("女儿"):
+                if candidate.startswith("我女儿"):
+                    candidate = "用户的女儿" + candidate[3:]
+                else:
+                    candidate = "用户的女儿" + candidate[2:]
+                current_subject = "用户的女儿"
+            elif candidate.startswith("我"):
+                candidate = "用户" + candidate[1:]
+                current_subject = "用户"
+            elif candidate.startswith("今年") and current_subject:
+                candidate = current_subject + candidate
+            elif candidate.startswith("叫") and current_subject:
+                candidate = current_subject + candidate
+
+            contextualized.append(candidate)
+        cleaned_text = re.sub(r"\s+", " ", text.strip())
+        return dedupe_facts(contextualized) or [f"用户提到：{cleaned_text[:120].rstrip()}"]
+
+    def heuristic_extract_fact_payloads(text: str, segment_index: int | None = None) -> List[dict]:
+        facts = heuristic_extract_facts(text)
+        payloads = []
+        for fact in facts:
+            payload = build_fact_payload(
+                fact,
+                subject="用户",
+                fact_type="fact",
+                confidence="medium",
+                segment_index=segment_index,
+            )
+            if payload:
+                payloads.append(payload)
+        return payloads
+
+    def dedupe_fact_payloads(fact_payloads: List[dict]) -> List[dict]:
+        deduped = []
+        seen = set()
+        for payload in fact_payloads:
+            content = normalize_fact_text(str(payload.get("content", "")))
+            if not content or content in seen:
+                continue
+            seen.add(content)
+            normalized_payload = dict(payload)
+            normalized_payload["content"] = content
+            normalized_payload["type"] = str(normalized_payload.get("type") or "fact").strip() or "fact"
+            normalized_payload["confidence"] = str(normalized_payload.get("confidence") or "medium").strip().lower() or "medium"
+            deduped.append(normalized_payload)
+        return deduped
+
+    def filter_memory_fact_payloads(fact_payloads: List[dict]) -> List[dict]:
+        filtered = []
+        for payload in dedupe_fact_payloads(fact_payloads):
+            if payload["confidence"] == "low":
+                continue
+            filtered.append(payload)
+        return filtered
+
+    def is_informative_segment_summary(summary: str | None) -> bool:
+        if not summary:
+            return False
+
+        normalized = re.sub(r"\s+", " ", summary).strip()
+        if not normalized:
+            return False
+
+        negative_patterns = [
+            "未提取到有效信息",
+            "没有明确",
+            "无意义碎片",
+            "内容不连贯",
+            "表达不清",
+            "不完整或无法理解",
+            "模糊不清",
+            "零散且不完整",
+            "未提供明确的信息",
+            "未提供明确的事实信息",
+            "噪声词",
+            "无法判断",
+        ]
+        if any(pattern in normalized for pattern in negative_patterns):
+            return False
+
+        positive_patterns = [
+            "提到",
+            "问题",
+            "风险",
+            "联系人",
+            "付款",
+            "转账",
+            "退款",
+            "供电",
+            "充电",
+            "设备",
+            "家人",
+            "妻子",
+            "儿子",
+            "女儿",
+            "关系",
+            "事件",
+            "困惑",
+            "求助",
+            "异常",
+            "担心",
+            "操作",
+        ]
+        return any(pattern in normalized for pattern in positive_patterns)
+
+    def extract_long_text_memories(text: str) -> tuple[str | None, List[dict], str | None, List[dict], List[dict]]:
+        user_messages = build_user_only_messages(text)
+        if not user_messages:
+            raise RuntimeError("No user messages found in long-text input")
+
+        user_only_text = render_user_messages(user_messages)
+        summary_context_text = render_messages(build_summary_context_messages(text))
+        segments = segment_user_messages(user_messages)
+        if not segments:
+            raise RuntimeError("Failed to segment long-text input")
+
+        session_summary = None
+        session_summary_payloads = []
+        segment_summaries = []
+        segment_summary_payloads = []
+        combined_facts = []
+        extraction_errors = []
+
+        try:
+            overall_summary, overall_facts = extract_structured_memories_with_ai(summary_context_text or user_only_text, long_text=True)
+            if overall_summary:
+                session_summary = overall_summary
+                if is_informative_segment_summary(overall_summary):
+                    session_summary_payloads.append(
+                        {
+                            "content": f"整段摘要：{overall_summary}",
+                            "subject": "用户",
+                            "type": "session_summary",
+                            "confidence": "medium",
+                            "segment_index": None,
+                        }
+                    )
+            if overall_facts:
+                combined_facts.extend(filter_memory_fact_payloads(overall_facts))
+        except Exception as overall_error:
+            extraction_errors.append(f"session: {overall_error}")
+            session_summary = extract_summary_from_long_text(text)
+
+        for segment in segments:
+            try:
+                summary, facts = extract_structured_memories_with_ai(segment["text"], long_text=True)
+                accepted_facts = filter_memory_fact_payloads(
+                    [
+                        {
+                            **fact,
+                            "segment_index": segment["segment_index"],
+                        }
+                        for fact in facts
+                    ]
+                )
+                if accepted_facts:
+                    combined_facts.extend(accepted_facts)
+                if summary:
+                    prefix = f"第{segment['segment_index']}段"
+                    if segment.get("time_range"):
+                        prefix += f"（{segment['time_range']}）"
+                    rendered_summary = f"{prefix}：{summary}"
+                    segment_summaries.append(rendered_summary)
+                    if is_informative_segment_summary(summary):
+                        segment_summary_payloads.append(
+                            {
+                                "content": rendered_summary,
+                                "subject": "用户",
+                                "type": "segment_summary",
+                                "confidence": "medium",
+                                "segment_index": segment["segment_index"],
+                            }
+                        )
+            except Exception as segment_error:
+                extraction_errors.append(f"segment_{segment['segment_index']}: {segment_error}")
+                fallback_facts = heuristic_extract_fact_payloads(
+                    segment["text"],
+                    segment_index=segment["segment_index"],
+                )
+                combined_facts.extend(fallback_facts)
+                fallback_summary = extract_summary_from_long_text(segment["text"])
+                if fallback_summary:
+                    prefix = f"第{segment['segment_index']}段"
+                    if segment.get("time_range"):
+                        prefix += f"（{segment['time_range']}）"
+                    rendered_summary = f"{prefix}：{fallback_summary}"
+                    segment_summaries.append(rendered_summary)
+                    if is_informative_segment_summary(fallback_summary):
+                        segment_summary_payloads.append(
+                            {
+                                "content": rendered_summary,
+                                "subject": "用户",
+                                "type": "segment_summary",
+                                "confidence": "medium",
+                                "segment_index": segment["segment_index"],
+                            }
+                        )
+        summary_parts = []
+        if session_summary:
+            summary_parts.append(f"整段摘要：{session_summary}")
+        summary_parts.extend(segment_summaries)
+        summary = "\n".join(summary_parts) if summary_parts else extract_summary_from_long_text(text)
+        accepted_facts = filter_memory_fact_payloads(combined_facts)
+        if not accepted_facts:
+            raise RuntimeError("Long-text extraction produced no usable facts")
+
+        error_reason = "; ".join(extraction_errors) if extraction_errors else None
+        return (
+            summary,
+            accepted_facts,
+            error_reason,
+            dedupe_fact_payloads(segment_summary_payloads),
+            dedupe_fact_payloads(session_summary_payloads),
         )
 
-    # If infer is disabled, skip AI extraction and store original text
-    if not request.infer:
-        return save_fallback("ai_disabled", "未启用AI提取，已存入原文")
+    def parse_structured_response(content: str) -> tuple[str | None, List[dict]]:
+        json_match = re.search(r"```json\s*(\{.*?\})\s*```", content, flags=re.S)
+        json_candidate = json_match.group(1) if json_match else content.strip()
+        data = json.loads(json_candidate)
+        summary = data.get("summary")
+        facts = data.get("facts") or []
+        if not isinstance(facts, list):
+            facts = []
+        parsed_facts = []
+        for item in facts:
+            if isinstance(item, dict):
+                content_value = normalize_fact_text(str(item.get("content", "")))
+                if not content_value:
+                    continue
+                parsed_facts.append(
+                    {
+                        "content": content_value,
+                        "subject": str(item.get("subject", "")).strip() or None,
+                        "type": str(item.get("type", "")).strip() or "fact",
+                        "confidence": str(item.get("confidence", "")).strip().lower() or "medium",
+                    }
+                )
+            else:
+                content_value = normalize_fact_text(str(item))
+                if not content_value:
+                    continue
+                parsed_facts.append(
+                    {
+                        "content": content_value,
+                        "subject": None,
+                        "type": "fact",
+                        "confidence": "medium",
+                    }
+                )
 
-    # Try to get memory client for extraction
-    try:
-        memory_client = get_memory_client()
-        if not memory_client:
-            raise Exception("Memory client is not available")
-    except Exception as client_error:
-        logging.error(f"Memory client unavailable: {client_error}")
-        return save_fallback("memory_client_unavailable", "未使用AI提取：memory_client不可用，已使用原文存入")
+        deduped = []
+        seen = set()
+        for fact in parsed_facts:
+            content_value = fact["content"]
+            if content_value in seen:
+                continue
+            seen.add(content_value)
+            deduped.append(fact)
+        return summary, deduped
 
-    # Try to save to Qdrant via memory_client
-    try:
-        qdrant_response = memory_client.add(
-            request.text,
-            user_id=request.user_id,  # Use string user_id to match search
+    def extract_structured_memories_with_ai(text: str, long_text: bool = False) -> tuple[str | None, List[dict]]:
+        from openai import OpenAI
+        from app.utils.memory import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY is not configured")
+
+        client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+        prompt_template = LONG_TEXT_STRUCTURED_MEMORY_EXTRACTION_PROMPT if long_text else STRUCTURED_MEMORY_EXTRACTION_PROMPT
+        prompt = prompt_template.format(input=text)
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "你必须输出合法 JSON，不要输出额外解释。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=1200,
+        )
+        content = (response.choices[0].message.content or "").strip()
+        if not content:
+            raise RuntimeError("AI returned empty structured extraction content")
+        return parse_structured_response(content)
+
+    def create_memory_record(
+        content: str,
+        fact_index: int,
+        segment_index: int | None = None,
+        confidence: str | None = None,
+        fact_type: str | None = None
+    ) -> Memory:
+        content = format_memory_content(content, fact_type=fact_type)
+        memory_metadata = dict(request.metadata or {})
+        memory_metadata.update(
+            {
+                "raw_record_id": str(raw_input.id),
+                "fact_index": fact_index,
+                "source_app": request.app,
+            }
+        )
+        if segment_index is not None:
+            memory_metadata["segment_index"] = segment_index
+        if confidence:
+            memory_metadata["confidence"] = confidence
+        if fact_type:
+            memory_metadata["fact_type"] = fact_type
+        memory = Memory(
+            id=uuid4(),
+            user_id=user.id,
+            app_id=app_obj.id,
+            content=content,
+            metadata_=memory_metadata,
+            state=MemoryState.active,
+        )
+        db.add(memory)
+        db.commit()
+        db.refresh(memory)
+
+        history = MemoryStatusHistory(
+            memory_id=memory.id,
+            changed_by=user.id,
+            old_state=MemoryState.deleted,
+            new_state=MemoryState.active,
+        )
+        db.add(history)
+        db.commit()
+        return memory
+
+    def save_memory_via_client(
+        content: str,
+        fact_index: int,
+        memory_client,
+        segment_index: int | None = None,
+        confidence: str | None = None,
+        fact_type: str | None = None
+    ) -> Memory:
+        content = format_memory_content(content, fact_type=fact_type)
+        response = memory_client.add(
+            content,
+            user_id=request.user_id,
             metadata={
                 "source_app": "openmemory",
                 "mcp_client": request.app,
-            }
+                "raw_record_id": str(raw_input.id),
+                "fact_index": fact_index,
+                "segment_index": segment_index,
+                "confidence": confidence,
+                "fact_type": fact_type,
+            },
         )
-        
-        # Log the response for debugging
-        logging.info(f"Qdrant response: {qdrant_response}")
-        
-        # Process Qdrant response
-        if isinstance(qdrant_response, dict) and 'results' in qdrant_response:
-            results = qdrant_response.get('results') or []
-            for result in results:
-                event_type = result.get('event')
-                # 优化提示：建议 LLM 输出格式，明确 event 字段要求
-                if event_type not in ['ADD', 'UPDATE', 'DELETE', 'NONE']:
-                    logging.warning(f"""LLM返回的 event 字段不规范: {event_type}，
-                    建议输出如下格式: {{\"memory\": [{{\"id\": \"0\", \"text\": \"xxx\", \"event\": \"ADD\"}}]}}。
-                    请确保 event 字段为 'ADD' 或 'UPDATE'，否则记忆将无法被正常写入。建议 LLM prompt 示例：你需要返回如下 
-                    JSON 格式：{{\"memory\":[{{\"id\":\"0\",\"text\":\"xxx\",\"event\":\"ADD\"}}]}}，其中 event 只能为 'ADD' 或 'UPDATE'。""")
-                if event_type in ['ADD', 'UPDATE']:
-                    # Get the Qdrant-generated ID
-                    memory_id = UUID(result['id'])
-                    # Check if memory already exists
-                    existing_memory = db.query(Memory).filter(Memory.id == memory_id).first()
-                    if existing_memory:
-                        # Update existing memory
-                        existing_memory.state = MemoryState.active
-                        existing_memory.content = result.get('memory', result.get('text', ''))
-                        memory = existing_memory
-                    else:
-                        # Create memory with the EXACT SAME ID from Qdrant
-                        memory = Memory(
-                            id=memory_id,  # Use the same ID that Qdrant generated
-                            user_id=user.id,
-                            app_id=app_obj.id,
-                            content=result.get('memory', result.get('text', '')),
-                            metadata_=request.metadata,
-                            state=MemoryState.active
-                        )
-                        db.add(memory)
-                    # Create history entry
-                    history = MemoryStatusHistory(
-                        memory_id=memory_id,
-                        changed_by=user.id,
-                        old_state=MemoryState.deleted if existing_memory else MemoryState.deleted,
-                        new_state=MemoryState.active
-                    )
-                    db.add(history)
-                    db.commit()
-                    db.refresh(memory)
-                    return build_create_response(memory)
+        logging.info(f"Qdrant response for fact #{fact_index}: {response}")
+
+        results = response.get("results") if isinstance(response, dict) else None
+        if not results:
+            return create_memory_record(
+                content,
+                fact_index,
+                segment_index=segment_index,
+                confidence=confidence,
+                fact_type=fact_type,
+            )
+
+        for result in results:
+            result_text = result.get("memory") or result.get("text") or content
+            event_type = result.get("event")
+            if event_type in ["ADD", "UPDATE"] and result.get("id"):
+                memory_id = UUID(result["id"])
+                existing_memory = db.query(Memory).filter(Memory.id == memory_id).first()
+                if existing_memory:
+                    existing_memory.content = result_text
+                    existing_memory.metadata_ = {
+                        **(existing_memory.metadata_ or {}),
+                        **(request.metadata or {}),
+                        "raw_record_id": str(raw_input.id),
+                        "fact_index": fact_index,
+                        "source_app": request.app,
+                        "segment_index": segment_index,
+                        "confidence": confidence,
+                        "fact_type": fact_type,
+                    }
+                    existing_memory.state = MemoryState.active
+                    db.add(existing_memory)
+                    memory = existing_memory
                 else:
-                    # 兜底：只要有 text 或 memory 字段就强制写入
-                    if result.get('memory') or result.get('text'):
-                        logging.warning(f"未知event: {event_type}，自动兜底为ADD，内容: {result}")
-                        memory_id = UUID(result['id']) if 'id' in result else uuid.uuid4()
-                        memory = Memory(
-                            id=memory_id,
-                            user_id=user.id,
-                            app_id=app_obj.id,
-                            content=result.get('memory', result.get('text', '')),
-                            metadata_=request.metadata,
-                            state=MemoryState.active
-                        )
-                        db.add(memory)
-                        history = MemoryStatusHistory(
-                            memory_id=memory_id,
-                            changed_by=user.id,
-                            old_state=MemoryState.deleted,
-                            new_state=MemoryState.active
-                        )
-                        db.add(history)
-                        db.commit()
-                        db.refresh(memory)
-                        return build_create_response(memory)
-            # AI ran but produced no usable memory -> fallback to original text
-            if not results:
-                summary = extract_summary_from_long_text(request.text)
-                if summary:
-                    return save_fallback(
-                        "ai_extraction_empty",
-                        "AI提取未返回可写入结果，已提取摘要存入",
-                        content_override=summary,
-                        extracted_text=summary
+                    memory = Memory(
+                        id=memory_id,
+                        user_id=user.id,
+                        app_id=app_obj.id,
+                        content=result_text,
+                        metadata_={
+                            **(request.metadata or {}),
+                            "raw_record_id": str(raw_input.id),
+                            "fact_index": fact_index,
+                            "source_app": request.app,
+                            "segment_index": segment_index,
+                            "confidence": confidence,
+                            "fact_type": fact_type,
+                        },
+                        state=MemoryState.active,
                     )
-                return save_fallback("ai_extraction_empty", "AI提取未返回可写入结果，已使用原文存入")
-            return save_fallback("ai_extraction_no_valid_event", "AI提取结果无法写入（event不合规），已使用原文存入")
-        return save_fallback("ai_extraction_invalid_response", "AI提取返回格式不正确，已使用原文存入")
-    except Exception as qdrant_error:
-        logging.error(f"Qdrant/LLM operation failed: {qdrant_error}")
-        return save_fallback("ai_extraction_failed", "未使用AI提取：AI/向量存储写入失败，已使用原文存入")
+                    db.add(memory)
+                db.commit()
+                db.refresh(memory)
+
+                history = MemoryStatusHistory(
+                    memory_id=memory.id,
+                    changed_by=user.id,
+                    old_state=MemoryState.deleted,
+                    new_state=MemoryState.active,
+                )
+                db.add(history)
+                db.commit()
+                return memory
+
+        return create_memory_record(
+            content,
+            fact_index,
+            segment_index=segment_index,
+            confidence=confidence,
+            fact_type=fact_type,
+        )
+
+    long_text_db_only = False
+
+    def persist_fact_payloads(fact_payloads: List[dict]) -> List[Memory]:
+        memories = []
+        for index, fact_payload in enumerate(fact_payloads, start=1):
+            content = fact_payload["content"]
+            fact_type = fact_payload.get("type")
+            use_memory_client = memory_client and not long_text_db_only and fact_type not in {"session_summary"}
+            if memory_client:
+                if use_memory_client:
+                    memories.append(
+                        save_memory_via_client(
+                            content,
+                            index,
+                            memory_client,
+                            segment_index=fact_payload.get("segment_index"),
+                            confidence=fact_payload.get("confidence"),
+                            fact_type=fact_type,
+                        )
+                    )
+                    continue
+                memories.append(
+                    create_memory_record(
+                        content,
+                        index,
+                        segment_index=fact_payload.get("segment_index"),
+                        confidence=fact_payload.get("confidence"),
+                        fact_type=fact_type,
+                    )
+                )
+                continue
+            memories.append(
+                create_memory_record(
+                    content,
+                    index,
+                    segment_index=fact_payload.get("segment_index"),
+                    confidence=fact_payload.get("confidence"),
+                    fact_type=fact_type,
+                )
+            )
+        return memories
+
+    created_memories: List[Memory] = []
+
+    if not request.infer:
+        facts = [request.text.strip()]
+        update_raw_input(
+            status="stored_without_ai",
+            summary=None,
+            facts=facts,
+            error_reason=None,
+        )
+        created_memories.append(create_memory_record(facts[0], 1))
+        return build_create_response(
+            created_memories,
+            ai_used=False,
+            reason="ai_disabled",
+            message="原始信息已入库，未启用AI提取，已按原文存入记忆表",
+        )
+
+    memory_client = None
+    client_error_message = None
+    try:
+        memory_client = get_memory_client()
+        if not memory_client:
+            raise RuntimeError("Memory client is not available")
+    except Exception as client_error:
+        client_error_message = str(client_error)
+        logging.error(f"Memory client unavailable: {client_error}")
+
+    try:
+        use_long_text_pipeline = should_use_long_text_pipeline(request.text)
+        extraction_warning = None
+        extracted_facts = []
+        memory_payloads = []
+
+        if use_long_text_pipeline:
+            long_text_db_only = True
+            summary, fact_payloads, extraction_warning, segment_summary_payloads, session_summary_payloads = extract_long_text_memories(request.text)
+            reason = "long_text_structured_facts_created"
+            status = "processed_long_text"
+            message = "已保存原始信息，并按长文本规则提取整段摘要与原子事实后写入记忆表"
+            extracted_facts = [fact["content"] for fact in fact_payloads]
+            memory_payloads = fact_payloads + session_summary_payloads
+        else:
+            summary, fact_payloads = extract_structured_memories_with_ai(request.text)
+            fact_payloads = filter_memory_fact_payloads(fact_payloads)
+            if not fact_payloads:
+                raise RuntimeError("AI returned no usable facts")
+            reason = "structured_facts_created"
+            status = "processed"
+            message = "已保存原始信息，并将AI提取的事实逐条写入记忆表"
+            extracted_facts = [fact["content"] for fact in fact_payloads]
+            memory_payloads = fact_payloads
+
+        update_raw_input(
+            status=status,
+            summary=summary,
+            facts=extracted_facts,
+            error_reason=extraction_warning,
+        )
+        created_memories.extend(persist_fact_payloads(memory_payloads))
+
+        if client_error_message:
+            message += "（向量存储不可用，本次仅写入数据库）"
+        if extraction_warning:
+            message += "（部分分段使用了兜底提取）"
+        return build_create_response(
+            created_memories,
+            ai_used=True,
+            reason=reason,
+            message=message,
+        )
+    except Exception as extraction_error:
+        logging.error(f"Structured extraction failed: {extraction_error}")
+        fallback_summary = extract_summary_from_long_text(request.text)
+        fallback_payloads = heuristic_extract_fact_payloads(request.text)
+        fallback_payloads = filter_memory_fact_payloads(fallback_payloads)
+        fallback_facts = [fact["content"] for fact in fallback_payloads]
+        update_raw_input(
+            status="processed_with_fallback",
+            summary=fallback_summary,
+            facts=fallback_facts,
+            error_reason=str(extraction_error),
+        )
+        created_memories.extend(persist_fact_payloads(fallback_payloads))
+        return build_create_response(
+            created_memories,
+            ai_used=False,
+            reason="structured_extraction_failed",
+            message="原始信息已入库，AI提取失败，已按兜底拆分结果写入记忆表",
+        )
 
 
 

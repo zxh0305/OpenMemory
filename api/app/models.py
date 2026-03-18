@@ -136,6 +136,34 @@ class Memory(Base):
         Index("idx_memory_user_app", "user_id", "app_id"),
     )
 
+
+class RawMemoryInput(Base):
+    __tablename__ = "raw_memory_inputs"
+
+    id = Column(String(32), primary_key=True, default=generate_uuid_without_hyphens)
+    user_id = Column(String(32), ForeignKey("users.id"), nullable=False, index=True)
+    app_id = Column(String(32), ForeignKey("apps.id"), nullable=False, index=True)
+    original_text = Column(Text, nullable=False)
+    summary = Column(Text, nullable=True)
+    extracted_facts = Column(JSON, default=list)
+    metadata_ = Column("metadata", JSON, default=dict)
+    infer = Column(Boolean, default=False, nullable=False)
+    processing_status = Column(String(50), default="pending", nullable=False, index=True)
+    error_reason = Column(Text, nullable=True)
+    processed_at = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, default=get_current_utc_time, index=True)
+    updated_at = Column(
+        DateTime, default=get_current_utc_time, onupdate=get_current_utc_time
+    )
+
+    user = relationship("User", foreign_keys=[user_id])
+    app = relationship("App", foreign_keys=[app_id])
+
+    __table_args__ = (
+        Index("idx_raw_memory_user_time", "user_id", "created_at"),
+        Index("idx_raw_memory_app_time", "app_id", "created_at"),
+    )
+
 class ArchivedMemory(Base):
     """
     归档记忆表 - 独立存储衰退后的记忆
@@ -378,6 +406,7 @@ for model_class, fields in [
     (User, ["id"]),
     (App, ["id", "owner_id"]),
     (Memory, ["id", "user_id", "app_id"]),
+    (RawMemoryInput, ["id", "user_id", "app_id"]),
     (ArchivedMemory, ["id", "user_id", "app_id"]),
     (Category, ["id"]),
     (Config, ["id"]),
