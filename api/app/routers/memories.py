@@ -1229,16 +1229,30 @@ async def create_memory(
             use_memory_client = memory_client and not long_text_db_only and fact_type not in {"session_summary"}
             if memory_client:
                 if use_memory_client:
-                    memories.append(
-                        save_memory_via_client(
-                            content,
-                            index,
-                            memory_client,
-                            segment_index=fact_payload.get("segment_index"),
-                            confidence=fact_payload.get("confidence"),
-                            fact_type=fact_type,
+                    try:
+                        memories.append(
+                            save_memory_via_client(
+                                content,
+                                index,
+                                memory_client,
+                                segment_index=fact_payload.get("segment_index"),
+                                confidence=fact_payload.get("confidence"),
+                                fact_type=fact_type,
+                            )
                         )
-                    )
+                    except Exception as memory_client_error:
+                        logging.error(
+                            f"Memory client add failed for fact #{index}, fallback to DB-only: {memory_client_error}"
+                        )
+                        memories.append(
+                            create_memory_record(
+                                content,
+                                index,
+                                segment_index=fact_payload.get("segment_index"),
+                                confidence=fact_payload.get("confidence"),
+                                fact_type=fact_type,
+                            )
+                        )
                     continue
                 memories.append(
                     create_memory_record(
