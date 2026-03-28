@@ -701,7 +701,12 @@ async def create_memory(
         current_chars = 0
 
         for message in messages:
-            rendered = f"[{message['timestamp']}] 用户: {message['content']}" if message["timestamp"] else f"用户: {message['content']}"
+            speaker = message.get("speaker") or "用户"
+            rendered = (
+                f"[{message['timestamp']}] {speaker}: {message['content']}"
+                if message.get("timestamp")
+                else f"{speaker}: {message['content']}"
+            )
             projected_chars = current_chars + len(rendered) + 1
             if current and (len(current) >= max_items or projected_chars > max_chars):
                 start_ts = current[0].get("timestamp")
@@ -711,7 +716,7 @@ async def create_memory(
                         "segment_index": len(segments) + 1,
                         "time_range": f"{start_ts}-{end_ts}" if start_ts and end_ts else None,
                         "messages": current,
-                        "text": render_user_messages(current),
+                        "text": render_messages(current),
                     }
                 )
                 current = []
@@ -728,7 +733,7 @@ async def create_memory(
                     "segment_index": len(segments) + 1,
                     "time_range": f"{start_ts}-{end_ts}" if start_ts and end_ts else None,
                     "messages": current,
-                    "text": render_user_messages(current),
+                    "text": render_messages(current),
                 }
             )
 
@@ -736,23 +741,32 @@ async def create_memory(
 
     def extract_summary_from_long_text(text: str) -> str | None:
         user_line_re = re.compile(r"\[(\d{2}:\d{2}:\d{2})\]\s*用户[:：]\s*(.+)")
+        ai_line_re = re.compile(r"\[(\d{2}:\d{2}:\d{2})\]\s*AI[:：]\s*(.+)", flags=re.I)
         first_user = None
+        first_ai = None
 
         for line in text.splitlines():
-            match = user_line_re.search(line)
-            if not match:
-                continue
-            content = match.group(2).strip()
-            if not content:
-                continue
-            first_user = (match.group(1), content)
-            break
+            user_match = user_line_re.search(line)
+            if user_match:
+                content = user_match.group(2).strip()
+                if content:
+                    first_user = (user_match.group(1), content)
+                    break
+            if not first_ai:
+                ai_match = ai_line_re.search(line)
+                if ai_match:
+                    ai_content = ai_match.group(2).strip()
+                    if ai_content:
+                        first_ai = (ai_match.group(1), ai_content)
 
         if first_user:
             return f"{first_user[0]} 用户提到：{first_user[1][:100].rstrip()}"
 
+        if first_ai:
+            return f"{first_ai[0]} AI提到：{first_ai[1][:100].rstrip()}"
+
         if text.strip():
-            return f"用户提到：{text.strip().replace(chr(10), ' ')[:120].rstrip()}"
+            return f"文本提到：{text.strip().replace(chr(10), ' ')[:120].rstrip()}"
         return None
 
     def should_use_long_text_pipeline(text: str) -> bool:
@@ -986,13 +1000,16 @@ async def create_memory(
         return any(pattern in normalized for pattern in positive_patterns)
 
     def extract_long_text_memories(text: str) -> tuple[str | None, List[dict], str | None, List[dict], List[dict]]:
+        all_messages = extract_user_messages(text)
         user_messages = build_user_only_messages(text)
-        if not user_messages:
-            raise RuntimeError("No user messages found in long-text input")
+        messages_for_extraction = user_messages if user_messages else all_messages
+        if not messages_for_extraction:
+            raise RuntimeError("No parsable chat messages found in long-text input")
 
-        user_only_text = render_user_messages(user_messages)
-        summary_context_text = render_messages(build_summary_context_messages(text))
-        segments = segment_user_messages(user_messages)
+        extraction_text = render_user_messages(user_messages) if user_messages else render_messages(messages_for_extraction)
+        summary_context_messages = build_summary_context_messages(text)
+        summary_context_text = render_messages(summary_context_messages) if summary_context_messages else extraction_text
+        segments = segment_user_messages(messages_for_extraction)
         if not segments:
             raise RuntimeError("Failed to segment long-text input")
 
@@ -1004,7 +1021,7 @@ async def create_memory(
         extraction_errors = []
 
         try:
-            overall_summary, overall_facts = extract_structured_memories_with_ai(summary_context_text or user_only_text, long_text=True)
+            overall_summary, overall_facts = extract_structured_memories_with_ai(summary_context_text or extraction_text, long_text=True)
             if overall_summary:
                 session_summary = overall_summary
                 if is_informative_segment_summary(overall_summary):
@@ -1409,40 +1426,6 @@ async def create_memory(
             message="原始信息已入库，未启用AI提取，已按原文存入记忆表",
         )
 
-    user_messages = build_user_only_messages(request.text)
-    if not user_messages:
-        system_event_payloads = filter_memory_fact_payloads(
-            extract_ai_system_event_payloads(request.text)
-        )
-        if not system_event_payloads:
-            update_raw_input(
-                status="skipped_no_user_facts",
-                summary=None,
-                facts=[],
-                error_reason="No user messages in input",
-            )
-            return build_create_response(
-                created_memories,
-                ai_used=False,
-                reason="no_user_messages_skipped",
-                message="输入中未检测到用户消息，本次仅保留原始记录，不写入记忆表",
-            )
-
-        system_event_facts = [fact["content"] for fact in system_event_payloads]
-        update_raw_input(
-            status="processed_system_events_only",
-            summary=None,
-            facts=system_event_facts,
-            error_reason="No user messages in input; stored system events only",
-        )
-        created_memories.extend(persist_fact_payloads(system_event_payloads))
-        return build_create_response(
-            created_memories,
-            ai_used=False,
-            reason="no_user_messages_system_events_only",
-            message="输入中未检测到用户消息，已仅提取并写入系统事件",
-        )
-
     memory_client = None
     client_error_message = None
     try:
@@ -1498,9 +1481,13 @@ async def create_memory(
         )
     except Exception as extraction_error:
         logging.error(f"Structured extraction failed: {extraction_error}")
-        user_only_text = render_user_messages(build_user_only_messages(request.text))
-        fallback_summary = extract_summary_from_long_text(user_only_text) if user_only_text else None
-        fallback_payloads = heuristic_extract_fact_payloads(user_only_text) if user_only_text else []
+        user_messages = build_user_only_messages(request.text)
+        fallback_source_text = render_user_messages(user_messages) if user_messages else normalize_chat_log(request.text)
+        fallback_summary = extract_summary_from_long_text(fallback_source_text) if fallback_source_text else None
+        if user_messages:
+            fallback_payloads = heuristic_extract_fact_payloads(fallback_source_text)
+        else:
+            fallback_payloads = extract_ai_system_event_payloads(request.text)
         fallback_payloads = filter_memory_fact_payloads(fallback_payloads)
         fallback_facts = [fact["content"] for fact in fallback_payloads]
         update_raw_input(
