@@ -1,10 +1,11 @@
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timedelta
 from typing import List, Optional, Set
 from uuid import UUID, uuid4
 import json
 import logging
 import os
 import re
+import hashlib
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, joinedload
 from fastapi_pagination import Page, Params
@@ -450,12 +451,18 @@ async def create_memory(
 
     logging.info(f"Creating memory for user_id: {request.user_id} with app: {request.app}")
 
+    def normalize_text_for_dedupe(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip())
+
+    normalized_input_text = normalize_text_for_dedupe(request.text)
+    input_hash = hashlib.sha256(normalized_input_text.encode("utf-8")).hexdigest() if normalized_input_text else None
+
     raw_input = RawMemoryInput(
         id=uuid4(),
         user_id=user.id,
         app_id=app_obj.id,
         original_text=request.text,
-        metadata_=request.metadata,
+        metadata_={**(request.metadata or {}), **({"input_hash": input_hash} if input_hash else {})},
         infer=request.infer,
         processing_status="pending",
     )
@@ -1353,6 +1360,39 @@ async def create_memory(
 
     created_memories: List[Memory] = []
 
+    if input_hash:
+        window_start = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=5)
+        recent_inputs = db.query(RawMemoryInput).filter(
+            RawMemoryInput.user_id == user.id,
+            RawMemoryInput.app_id == app_obj.id,
+            RawMemoryInput.id != raw_input.id,
+            RawMemoryInput.created_at >= window_start,
+        ).order_by(RawMemoryInput.created_at.desc()).limit(50).all()
+
+        duplicate_raw_input = None
+        for item in recent_inputs:
+            item_hash = (item.metadata_ or {}).get("input_hash")
+            if item_hash and item_hash == input_hash:
+                duplicate_raw_input = item
+                break
+            if normalize_text_for_dedupe(item.original_text) == normalized_input_text:
+                duplicate_raw_input = item
+                break
+
+        if duplicate_raw_input:
+            update_raw_input(
+                status="skipped_duplicate",
+                summary=None,
+                facts=[],
+                error_reason=f"Duplicate input within 5 minutes; original_raw_record_id={duplicate_raw_input.id}",
+            )
+            return build_create_response(
+                created_memories,
+                ai_used=False,
+                reason="duplicate_skipped",
+                message="检测到短时间重复内容，本次仅保留原始记录，不再重复写入记忆表",
+            )
+
     if not request.infer:
         facts = [request.text.strip()]
         update_raw_input(
@@ -1367,6 +1407,40 @@ async def create_memory(
             ai_used=False,
             reason="ai_disabled",
             message="原始信息已入库，未启用AI提取，已按原文存入记忆表",
+        )
+
+    user_messages = build_user_only_messages(request.text)
+    if not user_messages:
+        system_event_payloads = filter_memory_fact_payloads(
+            extract_ai_system_event_payloads(request.text)
+        )
+        if not system_event_payloads:
+            update_raw_input(
+                status="skipped_no_user_facts",
+                summary=None,
+                facts=[],
+                error_reason="No user messages in input",
+            )
+            return build_create_response(
+                created_memories,
+                ai_used=False,
+                reason="no_user_messages_skipped",
+                message="输入中未检测到用户消息，本次仅保留原始记录，不写入记忆表",
+            )
+
+        system_event_facts = [fact["content"] for fact in system_event_payloads]
+        update_raw_input(
+            status="processed_system_events_only",
+            summary=None,
+            facts=system_event_facts,
+            error_reason="No user messages in input; stored system events only",
+        )
+        created_memories.extend(persist_fact_payloads(system_event_payloads))
+        return build_create_response(
+            created_memories,
+            ai_used=False,
+            reason="no_user_messages_system_events_only",
+            message="输入中未检测到用户消息，已仅提取并写入系统事件",
         )
 
     memory_client = None
@@ -1424,8 +1498,9 @@ async def create_memory(
         )
     except Exception as extraction_error:
         logging.error(f"Structured extraction failed: {extraction_error}")
-        fallback_summary = extract_summary_from_long_text(request.text)
-        fallback_payloads = heuristic_extract_fact_payloads(request.text)
+        user_only_text = render_user_messages(build_user_only_messages(request.text))
+        fallback_summary = extract_summary_from_long_text(user_only_text) if user_only_text else None
+        fallback_payloads = heuristic_extract_fact_payloads(user_only_text) if user_only_text else []
         fallback_payloads = filter_memory_fact_payloads(fallback_payloads)
         fallback_facts = [fact["content"] for fact in fallback_payloads]
         update_raw_input(
@@ -1439,7 +1514,7 @@ async def create_memory(
             created_memories,
             ai_used=False,
             reason="structured_extraction_failed",
-            message="原始信息已入库，AI提取失败，已按兜底拆分结果写入记忆表",
+            message="原始信息已入库，AI提取失败，已按用户消息兜底拆分写入记忆表",
         )
 
 
