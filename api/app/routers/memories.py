@@ -11,8 +11,15 @@ from sqlalchemy.orm import Session, joinedload
 from fastapi_pagination import Page, Params
 from fastapi_pagination.ext.sqlalchemy import paginate as sqlalchemy_paginate
 from pydantic import BaseModel
-from sqlalchemy import or_, func
+from sqlalchemy import or_, func, case
 from app.utils.memory import get_memory_client
+from app.utils.fts import sync_memory_to_fts
+from app.utils.entity_index import (
+    extract_entities_from_facts,
+    extract_entities_from_content,
+    save_entities_for_memory,
+)
+from app.utils.search import hybrid_search
 
 from app.database import get_db
 from app.models import (
@@ -369,13 +376,38 @@ async def get_raw_memory_input(
         raise HTTPException(status_code=404, detail="Raw memory input not found")
 
     linked_memories = []
-    candidate_memories = db.query(Memory).filter(
-        Memory.user_id == raw_input.user_id,
-        Memory.app_id == raw_input.app_id,
+    seen_memory_ids = set()
+
+    # 优先使用显式外键关联（新纪录）
+    fk_memories = db.query(Memory).filter(
+        Memory.source_raw_input_id == raw_input.id,
         Memory.state != MemoryState.deleted,
     ).order_by(Memory.created_at.asc()).all()
 
-    for memory in candidate_memories:
+    for memory in fk_memories:
+        linked_memories.append(
+            {
+                "id": str(memory.id),
+                "content": memory.content,
+                "fact_index": (memory.metadata_ or {}).get("fact_index"),
+                "metadata_": memory.metadata_,
+                "state": memory.state.value if hasattr(memory.state, "value") else str(memory.state),
+                "created_at": int(memory.created_at.timestamp()) if memory.created_at else None,
+            }
+        )
+        seen_memory_ids.add(memory.id)
+
+    # 回退到 metadata 匹配（旧纪录，没有 source_raw_input_id 的记录）
+    old_candidate_memories = db.query(Memory).filter(
+        Memory.user_id == raw_input.user_id,
+        Memory.app_id == raw_input.app_id,
+        Memory.source_raw_input_id == None,
+        Memory.state != MemoryState.deleted,
+    ).order_by(Memory.created_at.asc()).all()
+
+    for memory in old_candidate_memories:
+        if memory.id in seen_memory_ids:
+            continue
         metadata = memory.metadata_ or {}
         if metadata.get("raw_record_id") == str(raw_input.id):
             linked_memories.append(
@@ -1210,6 +1242,7 @@ async def create_memory(
             content=content,
             metadata_=memory_metadata,
             state=MemoryState.active,
+            source_raw_input_id=raw_input.id,
         )
         db.add(memory)
         db.commit()
@@ -1223,6 +1256,13 @@ async def create_memory(
         )
         db.add(history)
         db.commit()
+
+        # 同步到 FTS 全文索引
+        try:
+            sync_memory_to_fts(memory.id, content)
+        except Exception as e:
+            logging.warning("FTS sync failed for memory %s: %s", memory.id, e)
+
         return memory
 
     def save_memory_via_client(
@@ -1278,6 +1318,7 @@ async def create_memory(
                         "fact_type": fact_type,
                     }
                     existing_memory.state = MemoryState.active
+                    existing_memory.source_raw_input_id = raw_input.id
                     db.add(existing_memory)
                     memory = existing_memory
                 else:
@@ -1296,6 +1337,7 @@ async def create_memory(
                             "fact_type": fact_type,
                         },
                         state=MemoryState.active,
+                        source_raw_input_id=raw_input.id,
                     )
                     db.add(memory)
                 db.commit()
@@ -1309,6 +1351,13 @@ async def create_memory(
                 )
                 db.add(history)
                 db.commit()
+
+                # 同步到 FTS 全文索引
+                try:
+                    sync_memory_to_fts(memory.id, result_text)
+                except Exception as e:
+                    logging.warning("FTS sync failed in save_memory_via_client: %s", e)
+
                 return memory
 
         return create_memory_record(
@@ -1419,6 +1468,13 @@ async def create_memory(
             error_reason=None,
         )
         created_memories.append(create_memory_record(facts[0], 1))
+        # 从原文提取实体
+        try:
+            entities = extract_entities_from_content(facts[0])
+            if entities:
+                save_entities_for_memory(created_memories[-1].id, entities)
+        except Exception as e:
+            logging.warning("Entity extraction (non-infer) failed: %s", e)
         return build_create_response(
             created_memories,
             ai_used=False,
@@ -1469,6 +1525,16 @@ async def create_memory(
         )
         created_memories.extend(persist_fact_payloads(memory_payloads))
 
+        # 从 AI 提取的事实中提取实体并建立索引
+        try:
+            for i, memory in enumerate(created_memories):
+                if i < len(memory_payloads):
+                    payload_entities = extract_entities_from_facts([memory_payloads[i]])
+                    if payload_entities:
+                        save_entities_for_memory(memory.id, payload_entities)
+        except Exception as e:
+            logging.warning("Entity extraction (infer) failed: %s", e)
+
         if client_error_message:
             message += "（向量存储不可用，本次仅写入数据库）"
         if extraction_warning:
@@ -1497,6 +1563,15 @@ async def create_memory(
             error_reason=str(extraction_error),
         )
         created_memories.extend(persist_fact_payloads(fallback_payloads))
+        # 从兜底提取的事实中提取实体
+        try:
+            for i, memory in enumerate(created_memories):
+                if i < len(fallback_payloads):
+                    payload_entities = extract_entities_from_facts([fallback_payloads[i]])
+                    if payload_entities:
+                        save_entities_for_memory(memory.id, payload_entities)
+        except Exception as e:
+            logging.warning("Entity extraction (fallback) failed: %s", e)
         return build_create_response(
             created_memories,
             ai_used=False,
@@ -1529,6 +1604,24 @@ async def get_memory(
     - user_id: 用户ID（查询参数，必填）
     """
     memory = get_memory_or_404(db, memory_id)
+
+    # Look up source raw input for traceability
+    source_raw_input = None
+    raw_input_id_to_query = memory.source_raw_input_id
+    if not raw_input_id_to_query and memory.metadata_:
+        raw_input_id_to_query = memory.metadata_.get("raw_record_id")
+    if raw_input_id_to_query:
+        raw_input = db.query(RawMemoryInput).filter(RawMemoryInput.id == raw_input_id_to_query).first()
+        if raw_input:
+            source_raw_input = {
+                "id": str(raw_input.id),
+                "original_text": raw_input.original_text,
+                "summary": raw_input.summary,
+                "extracted_facts": raw_input.extracted_facts or [],
+                "processing_status": raw_input.processing_status,
+                "created_at": int(raw_input.created_at.timestamp()) if raw_input.created_at else None,
+            }
+
     return {
         "id": memory.id,
         "text": memory.content,
@@ -1536,8 +1629,10 @@ async def get_memory(
         "state": memory.state.value,
         "app_id": memory.app_id,
         "app_name": memory.app.name if memory.app else None,
+        "source_raw_input": source_raw_input,
         "categories": [category.name for category in memory.categories],
         "metadata_": memory.metadata_,
+        "source_raw_input_id": str(memory.source_raw_input_id) if memory.source_raw_input_id else None,
         # 衰退相关字段
         "decay_score": getattr(memory, 'decay_score', 1.0),
         "importance_score": getattr(memory, 'importance_score', 0.5),
@@ -1580,16 +1675,22 @@ async def delete_memories(
     return {"message": f"Successfully deleted {len(request.memory_ids)} memories"}
 
 
+class ArchiveMemoriesRequest(BaseModel):
+    memory_ids: List[UUID]
+    user_id: str
+
 # Archive memories
 @router.post("/actions/archive")
 async def archive_memories(
-    memory_ids: List[UUID],
-    user_id: UUID,
+    request: ArchiveMemoriesRequest,
     db: Session = Depends(get_db)
 ):
-    for memory_id in memory_ids:
-        update_memory_state(db, memory_id, MemoryState.archived, user_id)
-    return {"message": f"Successfully archived {len(memory_ids)} memories"}
+    user = db.query(User).filter(User.user_id == request.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    for memory_id in request.memory_ids:
+        update_memory_state(db, memory_id, MemoryState.archived, user.id)
+    return {"message": f"Successfully archived {len(request.memory_ids)} memories"}
 
 
 class PauseMemoriesRequest(BaseModel):
@@ -1737,6 +1838,13 @@ async def update_memory(
     memory.content = request.memory_content
     db.commit()
     db.refresh(memory)
+
+    # 同步更新到 FTS 全文索引
+    try:
+        sync_memory_to_fts(memory.id, memory.content)
+    except Exception as e:
+        logging.warning("FTS sync failed after memory update: %s", e)
+
     return memory
 
 class FilterMemoriesRequest(BaseModel):
@@ -1798,9 +1906,35 @@ async def filter_memories(
     if not request.show_archived:
         query = query.filter(Memory.state != MemoryState.archived)
 
-    # Apply search filter
+    # Apply search filter - use hybrid search when search_query is provided
+    hybrid_ranked_ids = None
     if request.search_query:
-        query = query.filter(Memory.content.ilike(f"%{request.search_query}%"))
+        try:
+            memory_client = get_memory_client()
+        except Exception:
+            memory_client = None
+
+        # Use hybrid search (vector + BM25 + entity) when memory client is available
+        if memory_client:
+            try:
+                hybrid_results = hybrid_search(
+                    query=request.search_query,
+                    user_id=user.id,
+                    limit=request.size * 3 + 20,
+                    memory_client=memory_client,
+                )
+                if hybrid_results:
+                    hybrid_ranked_ids = [r['memory_id'] for r in hybrid_results]
+                    query = query.filter(Memory.id.in_(hybrid_ranked_ids))
+                else:
+                    # No results from hybrid search - force empty
+                    query = query.filter(Memory.id.is_(None))
+            except Exception as e:
+                logging.warning("Hybrid search failed, falling back to ILIKE: %s", e)
+                query = query.filter(Memory.content.ilike(f"%{request.search_query}%"))
+        else:
+            # Fallback to ILIKE when memory client unavailable
+            query = query.filter(Memory.content.ilike(f"%{request.search_query}%"))
 
     # Apply app filter
     if request.app_ids:
@@ -1825,7 +1959,14 @@ async def filter_memories(
         query = query.filter(Memory.created_at <= to_datetime)
 
     # Apply sorting
-    if request.sort_column and request.sort_direction:
+    if hybrid_ranked_ids and request.search_query:
+        # When using hybrid search, preserve the RRF ranking order
+        ordering = case(
+            {mid: idx for idx, mid in enumerate(hybrid_ranked_ids)},
+            value=Memory.id,
+        )
+        query = query.order_by(ordering)
+    elif request.sort_column and request.sort_direction:
         sort_direction = request.sort_direction.lower()
         if sort_direction not in ['asc', 'desc']:
             raise HTTPException(status_code=400, detail="Invalid sort direction")

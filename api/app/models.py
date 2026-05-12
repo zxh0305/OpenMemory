@@ -110,6 +110,7 @@ class Memory(Base):
     content = Column(Text, nullable=False)  # Modified: use Text type
     vector = Column(Text)  # Modified: use Text type
     metadata_ = Column("metadata", JSON, default=dict)
+    source_raw_input_id = Column(String(32), ForeignKey("raw_memory_inputs.id"), nullable=True, index=True)
     state = Column(Enum(MemoryState), default=MemoryState.active, index=True)
     created_at = Column(DateTime, default=get_current_utc_time, index=True)
     updated_at = Column(
@@ -126,6 +127,7 @@ class Memory(Base):
 
     user = relationship("User", back_populates="memories")
     app = relationship("App", back_populates="memories")
+    raw_input = relationship("RawMemoryInput", foreign_keys=[source_raw_input_id], back_populates="memories")
     categories = relationship(
         "Category", secondary="memory_categories", back_populates="memories"
     )
@@ -158,6 +160,7 @@ class RawMemoryInput(Base):
 
     user = relationship("User", foreign_keys=[user_id])
     app = relationship("App", foreign_keys=[app_id])
+    memories = relationship("Memory", foreign_keys="Memory.source_raw_input_id", back_populates="raw_input")
 
     __table_args__ = (
         Index("idx_raw_memory_user_time", "user_id", "created_at"),
@@ -247,6 +250,28 @@ memory_categories = Table(
     ),  # Modified
     Index("idx_memory_category", "memory_id", "category_id"),
 )
+
+
+class MemoryEntity(Base):
+    """记忆实体索引表 - 存储从记忆中提取的实体"""
+    __tablename__ = "memory_entities"
+    id = Column(
+        String(32), primary_key=True, default=generate_uuid_without_hyphens
+    )
+    memory_id = Column(
+        String(32), ForeignKey("memories.id"), nullable=False, index=True
+    )
+    entity_text = Column(String(255), nullable=False, index=True)
+    entity_type = Column(String(50), nullable=False, default="general", index=True)
+    created_at = Column(DateTime, default=get_current_utc_time, index=True)
+
+    memory = relationship("Memory", foreign_keys=[memory_id])
+
+    __table_args__ = (
+        Index("idx_entity_memory", "memory_id"),
+        Index("idx_entity_text", "entity_text"),
+        Index("idx_entity_text_type", "entity_text", "entity_type"),
+    )
 
 
 class AccessControl(Base):
@@ -414,6 +439,7 @@ for model_class, fields in [
     (ArchivePolicy, ["id", "criteria_id"]),
     (MemoryStatusHistory, ["id", "memory_id", "changed_by"]),
     (MemoryAccessLog, ["id", "memory_id", "app_id"]),
+    (MemoryEntity, ["id", "memory_id"]),
 ]:
     event.listen(
         model_class,

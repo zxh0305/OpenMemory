@@ -101,6 +101,87 @@ async def list_archived_memories(
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
 
 
+@router.get("/stats/summary")
+async def get_archived_stats(
+    user_id: str = Query(..., description="用户ID"),
+    db: Session = Depends(get_db)
+):
+    """
+    获取归档记忆的统计信息。
+
+    返回内容：
+    - total_archived: 总归档数量
+    - by_decay_score: 按衰退分数分类统计
+      - very_low: 衰退分数 < 0.05 的数量
+      - low: 衰退分数 0.05-0.1 的数量
+      - medium: 衰退分数 >= 0.1 的数量
+    - by_app: 按应用分类统计
+
+    参数:
+    - user_id: 用户ID（查询参数，必填）
+
+    使用场景：
+    - 了解归档记忆的分布情况
+    - 分析记忆衰退情况
+    """
+    try:
+        # 验证用户
+        user = db.query(User).filter(User.user_id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="用户不存在")
+
+        # 统计归档记忆
+        total_archived = db.query(ArchivedMemory).filter(
+            ArchivedMemory.user_id == user.id
+        ).count()
+
+        # 按应用统计
+        from sqlalchemy import func
+        app_stats = db.query(
+            ArchivedMemory.app_id,
+            func.count(ArchivedMemory.id).label('count')
+        ).filter(
+            ArchivedMemory.user_id == user.id
+        ).group_by(ArchivedMemory.app_id).all()
+
+        # 按衰退分数统计
+        very_low = db.query(ArchivedMemory).filter(
+            ArchivedMemory.user_id == user.id,
+            ArchivedMemory.decay_score_at_archive < 0.05
+        ).count()
+
+        low = db.query(ArchivedMemory).filter(
+            ArchivedMemory.user_id == user.id,
+            ArchivedMemory.decay_score_at_archive >= 0.05,
+            ArchivedMemory.decay_score_at_archive < 0.1
+        ).count()
+
+        medium = db.query(ArchivedMemory).filter(
+            ArchivedMemory.user_id == user.id,
+            ArchivedMemory.decay_score_at_archive >= 0.1
+        ).count()
+
+        return {
+            "success": True,
+            "total_archived": total_archived,
+            "by_decay_score": {
+                "very_low": very_low,  # < 0.05
+                "low": low,  # 0.05 - 0.1
+                "medium": medium  # >= 0.1
+            },
+            "by_app": [
+                {"app_id": str(app_id), "count": count}
+                for app_id, count in app_stats
+            ]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取归档统计失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"统计失败: {str(e)}")
+
+
 @router.get("/{memory_id}")
 async def get_archived_memory(
     memory_id: str,
@@ -143,7 +224,7 @@ async def get_archived_memory(
             "content": archived_memory.content,
             "user_id": str(archived_memory.user_id),
             "app_id": str(archived_memory.app_id),
-            "metadata": archived_memory.metadata_,
+            "metadata_": archived_memory.metadata_,
             "created_at": archived_memory.created_at.isoformat(),
             "updated_at": archived_memory.updated_at.isoformat(),
             "archived_at": archived_memory.archived_at.isoformat(),
@@ -272,82 +353,3 @@ async def delete_archived_memory(
         raise HTTPException(status_code=500, detail=f"删除失败: {str(e)}")
 
 
-@router.get("/stats/summary")
-async def get_archived_stats(
-    user_id: str = Query(..., description="用户ID"),
-    db: Session = Depends(get_db)
-):
-    """
-    获取归档记忆的统计信息。
-    
-    返回内容：
-    - total_archived: 总归档数量
-    - by_decay_score: 按衰退分数分类统计
-      - very_low: 衰退分数 < 0.05 的数量
-      - low: 衰退分数 0.05-0.1 的数量
-      - medium: 衰退分数 >= 0.1 的数量
-    - by_app: 按应用分类统计
-    
-    参数:
-    - user_id: 用户ID（查询参数，必填）
-    
-    使用场景：
-    - 了解归档记忆的分布情况
-    - 分析记忆衰退情况
-    """
-    try:
-        # 验证用户
-        user = db.query(User).filter(User.user_id == user_id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="用户不存在")
-        
-        # 统计归档记忆
-        total_archived = db.query(ArchivedMemory).filter(
-            ArchivedMemory.user_id == user.id
-        ).count()
-        
-        # 按应用统计
-        from sqlalchemy import func
-        app_stats = db.query(
-            ArchivedMemory.app_id,
-            func.count(ArchivedMemory.id).label('count')
-        ).filter(
-            ArchivedMemory.user_id == user.id
-        ).group_by(ArchivedMemory.app_id).all()
-        
-        # 按衰退分数统计
-        very_low = db.query(ArchivedMemory).filter(
-            ArchivedMemory.user_id == user.id,
-            ArchivedMemory.decay_score_at_archive < 0.05
-        ).count()
-        
-        low = db.query(ArchivedMemory).filter(
-            ArchivedMemory.user_id == user.id,
-            ArchivedMemory.decay_score_at_archive >= 0.05,
-            ArchivedMemory.decay_score_at_archive < 0.1
-        ).count()
-        
-        medium = db.query(ArchivedMemory).filter(
-            ArchivedMemory.user_id == user.id,
-            ArchivedMemory.decay_score_at_archive >= 0.1
-        ).count()
-        
-        return {
-            "success": True,
-            "total_archived": total_archived,
-            "by_decay_score": {
-                "very_low": very_low,  # < 0.05
-                "low": low,  # 0.05 - 0.1
-                "medium": medium  # >= 0.1
-            },
-            "by_app": [
-                {"app_id": str(app_id), "count": count}
-                for app_id, count in app_stats
-            ]
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"获取归档统计失败: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"统计失败: {str(e)}")

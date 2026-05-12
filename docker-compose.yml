@@ -54,8 +54,6 @@ services:
       - ui/.env
     environment:
       - PORT=4000
-      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8765}
-      - NEXT_PUBLIC_USER_ID=${NEXT_PUBLIC_USER_ID:-${USER:-default_user}}
     depends_on:
       openmemory-api:
         condition: service_healthy

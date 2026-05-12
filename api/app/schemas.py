@@ -49,6 +49,7 @@ class MemoryResponse(BaseModel):
     app_name: str
     categories: List[str]
     metadata_: Optional[dict] = None
+    source_raw_input_id: Optional[str] = None
     
     # 衰退相关字段
     decay_score: Optional[float] = Field(default=1.0, description="记忆衰退分数 (0.0-1.0)")

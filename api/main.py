@@ -13,6 +13,7 @@ from app.models import User, App
 from uuid import uuid4
 from app.config import USER_ID, DEFAULT_APP_ID
 from app.tasks import start_decay_scheduler, stop_decay_scheduler
+from app.utils.fts import init_fts_table
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -131,7 +132,11 @@ async def startup_event():
         logger.info("✅ 记忆衰退调度器启动成功")
     except Exception as e:
         logger.error(f"❌ 记忆衰退调度器启动失败: {e}")
-    
+
+    # 初始化 FTS5 全文索引
+    if init_fts_table():
+        logger.info("✅ FTS5 全文索引初始化成功")
+
     logger.info("=" * 60)
     logger.info("✅ OpenMemory API 启动完成")
     logger.info("📖 API 文档: http://localhost:8765/docs")

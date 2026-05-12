@@ -20,6 +20,7 @@ import json
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from app.utils.memory import get_memory_client
+from app.utils.search import hybrid_search
 from fastapi import FastAPI, Request
 from fastapi.routing import APIRouter
 import contextvars
@@ -31,7 +32,6 @@ from app.utils.db import get_user_and_app
 import uuid
 import datetime
 from app.utils.permissions import check_memory_access_permissions
-from qdrant_client import models as qdrant_models
 
 # Load environment variables
 load_dotenv()
@@ -179,6 +179,19 @@ async def add_memories(text: str) -> str:
 
                 db.commit() # 处理完所有结果后提交一次
 
+            # 同步到 FTS 全文索引
+            try:
+                from app.utils.fts import sync_memory_to_fts
+                if isinstance(response, dict) and 'results' in response:
+                    for result in response['results']:
+                        if result['event'] in ('ADD', 'UPDATE'):
+                            memory_id = result['id'].replace('-', '')
+                            content = result.get('memory', '')
+                            if memory_id and content:
+                                sync_memory_to_fts(memory_id, content)
+            except Exception as e:
+                logging.warning(f"FTS sync failed after add_memories: {e}")
+
             # 返回格式化的字符串响应而非字典
             if isinstance(response, dict) and 'results' in response:
                 result_count = len(response['results'])
@@ -221,156 +234,71 @@ async def search_memory(query: str) -> str:
             user, app = get_user_and_app(db, user_id=uid, app_id=client_name)
             logging.info(f"search_memory: user_id={uid}, client_name={client_name}, db_user_id={user.id}, app_id={app.id}")
 
-            # 根据访问控制列表获取可访问的记忆ID
+            # 获取用户权限范围内的记忆 ID 集合
             user_memories = db.query(Memory).filter(Memory.user_id == user.id).all()
             logging.info(f"search_memory: Found {len(user_memories)} memories for user")
-            accessible_memory_ids = [memory.id for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
+            accessible_memory_ids = {memory.id for memory in user_memories if check_memory_access_permissions(db, memory, app.id)}
             logging.info(f"search_memory: {len(accessible_memory_ids)} memories are accessible")
-            
-            # 构建Qdrant过滤条件
-            # 注意：Qdrant中存储的user_id是User.id（UUID），不是User.user_id（字符串）
-            conditions = [qdrant_models.FieldCondition(key="user_id", match=qdrant_models.MatchValue(value=str(user.id)))]
-            logging.info(f"search_memory: Using user.id={user.id} for Qdrant filter")
-            
-            # 注意：不使用HasIdCondition进行权限过滤，因为：
-            # 1. Qdrant中的ID与MySQL中的Memory.id不同（重建时生成的新ID）
-            # 2. user_id过滤已经确保只返回该用户的记忆
-            # 3. 权限检查将在返回结果后进行
-            
-            filters = qdrant_models.Filter(must=conditions)
-            logging.info(f"search_memory: Using {len(conditions)} filter conditions (user_id only)")
-            
-            # 生成查询文本的嵌入向量
-            logging.info(f"search_memory: Generating embeddings for query: {query}")
-            embeddings = memory_client.embedding_model.embed(query, "search")
-            logging.info(f"search_memory: Embeddings generated, length: {len(embeddings)}")
-            
-            # 在向量存储中执行相似性搜索
-            logging.info(f"search_memory: Querying Qdrant with {len(conditions)} filter conditions")
-            hits = memory_client.vector_store.client.query_points(
-                collection_name=memory_client.vector_store.collection_name,
-                query=embeddings,
-                query_filter=filters,
+
+            # 使用混合搜索（向量 + BM25 + 实体匹配 + RRF 融合）
+            logging.info(f"search_memory: Running hybrid search for query: {query}")
+            hybrid_results = hybrid_search(
+                query=query,
+                user_id=user.id,
                 limit=10,
+                memory_client=memory_client,
             )
-            logging.info(f"search_memory: Qdrant query completed, got {len(hits.points)} points")
+            logging.info(f"search_memory: Hybrid search returned {len(hybrid_results)} results")
 
-            # 处理搜索结果
-            memories = hits.points
-            logging.info(f"search_memory: Qdrant returned {len(memories)} results")
-            memories = [
-                {
-                    "id": memory.id,
-                    "memory": memory.payload["data"],
-                    "hash": memory.payload.get("hash"),
-                    "created_at": memory.payload.get("created_at"),
-                    "updated_at": memory.payload.get("updated_at"),
-                    "score": memory.score,
-                }
-                for memory in memories
-            ]
+            # 将融合结果转为标准格式
+            memories = []
+            for result in hybrid_results:
+                memory_id = result['memory_id']
+                if memory_id not in accessible_memory_ids:
+                    continue
 
-            # Qdrant无结果时查MySQL兜底
-            if not memories:
-                logging.info(f"search_memory: No Qdrant results, trying MySQL fallback with query: {query}")
-                
-                # 将查询分词，支持多关键词搜索
-                keywords = query.lower().split()
-                from sqlalchemy import or_
-                
-                # 构建OR条件：任何一个关键词匹配都返回
-                conditions = [Memory.content.ilike(f"%{keyword}%") for keyword in keywords if len(keyword) > 1]
-                
-                if conditions:
-                    mysql_results = db.query(Memory).filter(
-                        Memory.user_id == user.id,
-                        or_(*conditions)
-                    ).all()
-                else:
-                    # 如果没有有效关键词，使用原始查询
-                    mysql_results = db.query(Memory).filter(
-                        Memory.user_id == user.id,
-                        Memory.content.ilike(f"%{query}%")
-                    ).all()
-                
-                logging.info(f"search_memory: MySQL returned {len(mysql_results)} results")
-                for memory in mysql_results:
-                    # 检查权限
-                    if memory.id in accessible_memory_ids:
-                        memories.append({
-                            "id": str(memory.id),
-                            "memory": memory.content,
-                            "hash": getattr(memory, "hash", None),
-                            "created_at": memory.created_at.isoformat() if memory.created_at else None,
-                            "updated_at": memory.updated_at.isoformat() if memory.updated_at else None,
-                            "score": None,
-                        })
-                logging.info(f"search_memory: After permission filter, {len(memories)} memories accessible")
+                memory_obj = db.query(Memory).filter(Memory.id == memory_id).first()
+                if not memory_obj:
+                    continue
 
-            # 为每个找到的记忆记录访问日志并更新last_accessed_at
+                memories.append({
+                    "id": memory_id,
+                    "memory": memory_obj.content,
+                    "hash": None,
+                    "created_at": memory_obj.created_at.isoformat() if memory_obj.created_at else None,
+                    "updated_at": memory_obj.updated_at.isoformat() if memory_obj.updated_at else None,
+                    "score": result.get('rrf_score'),
+                    "app_name": memory_obj.app.name if memory_obj.app else None,
+                    "source": "hybrid_search",
+                    "decay_score": memory_obj.decay_score,
+                    "importance_score": memory_obj.importance_score,
+                })
+
+            # 更新访问统计
             now = datetime.datetime.now(datetime.UTC)
-            if isinstance(memories, dict) and 'results' in memories:
-                print(f"Memories: {memories}")
-                for memory_data in memories['results']:
-                    if 'id' in memory_data:
-                        memory_id = uuid.UUID(memory_data['id'])
-                        
-                        # 更新记忆的last_accessed_at字段
-                        memory_obj = db.query(Memory).filter(Memory.id == memory_id).first()
-                        if memory_obj:
-                            memory_obj.last_accessed_at = now
-                        
-                        # 创建访问日志条目
-                        access_log = MemoryAccessLog(
-                            memory_id=memory_id,
-                            app_id=app.id,
-                            access_type="search",
-                            metadata_={
-                                "query": query,
-                                "score": memory_data.get('score'),
-                                "hash": memory_data.get('hash')
-                            }
-                        )
-                        db.add(access_log)
-                db.commit()
-            else:
-                logging.info(f"search_memory: Updating last_accessed_at for {len(memories)} memories")
-                for memory in memories:
-                    # Qdrant返回的是标准UUID格式（带连字符），需要转换为MySQL格式（无连字符）
-                    qdrant_id = memory['id']
-                    if isinstance(qdrant_id, str) and '-' in qdrant_id:
-                        # 移除连字符以匹配MySQL中的格式
-                        mysql_id = qdrant_id.replace('-', '')
-                    else:
-                        mysql_id = str(qdrant_id)
-                    
-                    logging.info(f"search_memory: Converting Qdrant ID {qdrant_id} to MySQL ID {mysql_id}")
-                    
-                    # 更新记忆的last_accessed_at和access_count字段
-                    memory_obj = db.query(Memory).filter(Memory.id == mysql_id).first()
-                    if memory_obj:
-                        memory_obj.last_accessed_at = now
-                        memory_obj.access_count = (memory_obj.access_count or 0) + 1
-                        logging.info(f"search_memory: Updated last_accessed_at and access_count (now {memory_obj.access_count}) for memory {mysql_id}")
-                    else:
-                        logging.warning(f"search_memory: Memory {mysql_id} not found in database")
-                    
-                    # 创建访问日志条目（使用MySQL格式的ID）
-                    access_log = MemoryAccessLog(
-                        memory_id=mysql_id,
-                        app_id=app.id,
-                        access_type="search",
-                        metadata_={
-                            "query": query,
-                            "score": memory.get('score'),
-                            "hash": memory.get('hash')
-                        }
-                    )
-                    db.add(access_log)
-                db.commit()
-                logging.info(f"search_memory: Committed {len(memories)} access logs and access_count updates")
-            
-            # 返回JSON格式的搜索结果
+            logging.info(f"search_memory: Updating last_accessed_at for {len(memories)} memories")
+            for memory in memories:
+                memory_id = memory['id']
+                memory_obj = db.query(Memory).filter(Memory.id == memory_id).first()
+                if memory_obj:
+                    memory_obj.last_accessed_at = now
+                    memory_obj.access_count = (memory_obj.access_count or 0) + 1
+
+                access_log = MemoryAccessLog(
+                    memory_id=memory_id,
+                    app_id=app.id,
+                    access_type="search",
+                    metadata_={
+                        "query": query,
+                        "score": memory.get('score'),
+                        "hash": memory.get('hash'),
+                    }
+                )
+                db.add(access_log)
+
+            db.commit()
+            logging.info(f"search_memory: Committed {len(memories)} access logs and access_count updates")
+
             return json.dumps(memories, indent=2, ensure_ascii=False)
         finally:
             db.close()
